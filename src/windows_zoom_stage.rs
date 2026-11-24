@@ -159,6 +159,16 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
     }
 }
 
+/// Disarms wheel capture and clears wheel/interrupt flags WITHOUT clearing queued mouse events,
+/// so the reveal path can drain all clicks that arrived before and during `dwm_flush()` + `hide()`.
+pub fn disarm_zoom_capture_preserving_mouse_events() {
+    ZOOM_CAPTURE_CTRL_WHEEL.store(false, Ordering::SeqCst);
+    ZOOM_CAPTURE_ARMED.store(false, Ordering::SeqCst);
+    ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
+    ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
+    ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
+}
+
 /// Called from `main_hwnd`'s WndProc hook on `WM_MOUSEWHEEL`.
 /// Returns `true` if the wheel message was consumed by the active floating zoom stage.
 pub fn try_consume_main_wheel(wparam: WPARAM, lparam: LPARAM) -> bool {
@@ -666,5 +676,50 @@ pub(crate) fn ensure_foreground(hwnd: HWND) {
         if GetForegroundWindow() != hwnd {
             SetForegroundWindow(hwnd);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn disarm_preserving_mouse_events_retains_clicks_queued_during_reveal() {
+        set_zoom_capture_armed(true, false);
+        push_mouse_event(
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt: (320, 240),
+                modifiers: ZoomStageModifiers::default(),
+            },
+            false,
+        );
+        push_mouse_event(
+            ZoomStageMouseEvent::SecondaryUp {
+                screen_pt: (320, 240),
+                modifiers: ZoomStageModifiers::default(),
+            },
+            false,
+        );
+
+        disarm_zoom_capture_preserving_mouse_events();
+        assert!(!is_zoom_capture_armed());
+
+        let drained = drain_mouse_events();
+        assert_eq!(drained.len(), 2);
+        assert!(matches!(
+            drained[0],
+            ZoomStageMouseEvent::SecondaryDown {
+                screen_pt: (320, 240),
+                ..
+            }
+        ));
+        assert!(matches!(
+            drained[1],
+            ZoomStageMouseEvent::SecondaryUp {
+                screen_pt: (320, 240),
+                ..
+            }
+        ));
+        assert!(drain_mouse_events().is_empty());
     }
 }

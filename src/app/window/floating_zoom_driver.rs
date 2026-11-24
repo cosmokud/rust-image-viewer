@@ -56,14 +56,17 @@ impl ImageViewer {
             self.floating_zoom_settled_zoom = None;
             self.clear_zoom_stage_click_handoff_state();
             if let Some(session) = self.floating_zoom_session.take() {
-                if session.main_cloaked {
-                    let main_hwnd = self.resolved_main_hwnd();
-                    if !main_hwnd.is_null() {
-                        crate::windows_env::set_window_cloaked(main_hwnd, false);
-                    }
+                let main_hwnd = self.resolved_main_hwnd();
+                if session.main_cloaked && !main_hwnd.is_null() {
+                    crate::windows_env::set_window_cloaked(main_hwnd, false);
                 }
-            }
-            if let Some(stage) = self.zoom_stage_window.as_mut() {
+                if let Some(stage) = self.zoom_stage_window.as_mut() {
+                    stage.hide();
+                }
+                if !main_hwnd.is_null() {
+                    crate::windows_env::sync_main_window_cursor_pos(main_hwnd);
+                }
+            } else if let Some(stage) = self.zoom_stage_window.as_mut() {
                 stage.hide();
             }
         }
@@ -278,8 +281,8 @@ impl ImageViewer {
             // Zoom-out entry: commit frame 0 covering main_hwnd before cloaking so main_hwnd never peeks behind shrinking stage.
             state.current_frame()
         } else {
-            // Zoom-in entry: rect1 >= rect0 already covers main_hwnd.
-            state.step(1.0 / 60.0)
+            // Zoom-in entry: start smoothly without a 1/60s lurch; rect1 >= rect0 already covers main_hwnd.
+            state.step(1.0 / 120.0)
         };
 
         if let Some(stage) = self.zoom_stage_window.as_ref() {
@@ -394,6 +397,7 @@ impl ImageViewer {
                     stage.hide();
                 }
                 crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
+                crate::windows_env::sync_main_window_cursor_pos(main_hwnd);
                 ctx.request_repaint();
                 return;
             }
@@ -511,27 +515,35 @@ impl ImageViewer {
                         .is_some_and(|(cw, ch)| {
                             (cw - target_rect.width()).abs() <= 1
                                 && (ch - target_rect.height()).abs() <= 1
-                                && (screen_px.x - cw as f32).abs() <= 1.0
-                                && (screen_px.y - ch as f32).abs() <= 1.0
+                                && (screen_px.x - cw as f32).abs() <= 2.0
+                                && (screen_px.y - ch as f32).abs() <= 2.0
                         });
                     if client_matches {
                         matched_frames = matched_frames.saturating_add(1);
                     }
 
                     if matched_frames >= 2 || started_at.elapsed() >= Duration::from_millis(150) {
+                        self.floating_zoom_settled_zoom = Some(self.zoom);
+                        // 1) Uncloak main_hwnd
+                        crate::windows_env::set_window_cloaked(main_hwnd, false);
+                        // 2) Wait for DWM composition so main_hwnd is visible on screen
+                        crate::windows_zoom_stage::dwm_flush();
+                        // 3) Hide zoom_hwnd so no further mouse messages can land on it
+                        if let Some(stage) = self.zoom_stage_window.as_mut() {
+                            stage.hide();
+                        }
+                        // 4) Disarm zoom capture WITHOUT clearing queued mouse events
+                        crate::windows_zoom_stage::disarm_zoom_capture_preserving_mouse_events();
+                        // 5) Drain all pre-flush and during-flush mouse events
                         let reveal_now = Instant::now();
                         for event in crate::windows_zoom_stage::drain_mouse_events() {
                             session
                                 .pending_inputs
                                 .record_event(event, reveal_now, click_tol);
                         }
-                        self.floating_zoom_settled_zoom = Some(self.zoom);
-                        crate::windows_env::set_window_cloaked(main_hwnd, false);
-                        crate::windows_zoom_stage::dwm_flush();
-                        if let Some(stage) = self.zoom_stage_window.as_mut() {
-                            stage.hide();
-                        }
-                        crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
+                        // 6) Resync main_hwnd cursor pos so stationary clicks never see PointerGone
+                        crate::windows_env::sync_main_window_cursor_pos(main_hwnd);
+                        // 7) Hand off all drained mouse events cleanly
                         self.handoff_zoom_stage_inputs(
                             ctx,
                             main_hwnd,
@@ -586,8 +598,8 @@ impl ImageViewer {
             && crate::windows_zoom_stage::client_size(main_hwnd).is_some_and(|(cw, ch)| {
                 (cw - target_rect.width()).abs() <= 1
                     && (ch - target_rect.height()).abs() <= 1
-                    && (screen_px.x - cw as f32).abs() <= 1.0
-                    && (screen_px.y - ch as f32).abs() <= 1.0
+                    && (screen_px.x - cw as f32).abs() <= 2.0
+                    && (screen_px.y - ch as f32).abs() <= 2.0
             });
 
         if !rect_already_matches {

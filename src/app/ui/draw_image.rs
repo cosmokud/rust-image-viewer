@@ -138,7 +138,9 @@ impl ImageViewer {
             let regular_scroll_zoom_bound = self
                 .action_uses_binding(Action::ZoomIn, InputBinding::ScrollUp)
                 || self.action_uses_binding(Action::ZoomOut, InputBinding::ScrollDown);
-            let pointer_pos_for_wheel = ctx.input(|i| i.pointer.hover_pos());
+            let pointer_pos_for_wheel = ctx
+                .input(|i| i.pointer.hover_pos())
+                .or_else(|| self.live_cursor_pos_in_window(ctx, screen_rect));
             let pointer_over_shortcut_ui_for_wheel =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos_for_wheel, screen_rect);
             let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
@@ -305,7 +307,10 @@ impl ImageViewer {
                 });
                 let scroll_delta = ctx.input(|i| i.smooth_scroll_delta.y);
                 if raw_unmodified_notches != 0.0 || scroll_delta != 0.0 {
-                    if let Some(pos) = ctx.input(|i| i.pointer.hover_pos()) {
+                    if let Some(pos) = ctx
+                        .input(|i| i.pointer.hover_pos())
+                        .or_else(|| self.live_cursor_pos_in_window(ctx, screen_rect))
+                    {
                         // Only suppress zoom when the pointer is on the title *text* (or window buttons),
                         // not on the empty title bar area.
                         if title_ui_blocking {
@@ -361,8 +366,25 @@ impl ImageViewer {
                 }
             }
 
-            // Get pointer state
-            pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            // Get pointer state (fall back to live client-space cursor when focused or clicking so
+            // stationary-cursor clicks right after an overlay hides are never dropped).
+            let pointer_activity = ctx.input(|i| {
+                i.focused
+                    || i.pointer.any_pressed()
+                    || i.pointer.any_down()
+                    || i.pointer.any_released()
+                    || i.pointer.button_clicked(egui::PointerButton::Primary)
+                    || i.pointer
+                        .button_double_clicked(egui::PointerButton::Primary)
+                    || i.pointer.button_clicked(egui::PointerButton::Secondary)
+            });
+            pointer_pos = ctx
+                .input(|i| i.pointer.hover_pos().or_else(|| i.pointer.interact_pos()))
+                .or_else(|| {
+                    pointer_activity
+                        .then(|| self.live_cursor_pos_in_window(ctx, screen_rect))
+                        .flatten()
+                });
             let primary_clicked =
                 ctx.input(|i| i.pointer.button_clicked(egui::PointerButton::Primary));
             // egui only knows the pointer while it holds it: a `PointerGone` (cursor left the
@@ -510,7 +532,7 @@ impl ImageViewer {
             if !self.mode().is_fullscreen() {
                 #[cfg(target_os = "windows")]
                 {
-                    if !primary_down {
+                    if !primary_down || primary_pressed {
                         if let Some(press_pt) =
                             self.pending_zoom_stage_primary_click_candidate.take()
                         {

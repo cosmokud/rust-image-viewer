@@ -2,11 +2,15 @@
 
 /// Default per-notch multiplier matching `rust-hover-preview` and prior ~5-frame `smooth_scroll_delta` feel.
 pub(crate) const DEFAULT_FLOATING_ZOOM_PER_NOTCH: f32 = 1.10;
-/// Settle threshold in physical pixels: snaps sub-pixel exponential tail cleanly.
+/// Settle threshold in physical pixels: snaps sub-pixel spring tail cleanly.
 pub(crate) const FLOATING_ZOOM_SETTLED_PX: f32 = 0.5;
-/// Exponential chase time constant: 90% of remaining travel in 100ms.
-pub(crate) const FLOATING_ZOOM_RELEASE_SECONDS: f32 = 0.1;
-const FLOATING_ZOOM_RELEASE_LEFT: f32 = 0.1;
+/// Velocity settle threshold in physical pixels per second so the spring never snaps while gliding.
+pub(crate) const FLOATING_ZOOM_SETTLED_VEL_PX_PER_SEC: f32 = 2.0;
+/// Natural angular frequency (rad/s) for the critically damped (`zeta = 1.0`) log-space spring:
+/// smooth velocity ramp on frame 1 (< 4% at 60Hz), ~180-220ms glide, zero overshoot, zero bounce.
+pub(crate) const FLOATING_ZOOM_SPRING_OMEGA: f32 = 18.0;
+/// Stage 2 pan-return zone width as a fraction of window width (`25%` overhang above `cap_w`).
+pub(crate) const FLOATING_ZOOM_HOME_RETURN_ZONE_FRAC: f32 = 0.25;
 /// Max frame dt (seconds) so a stall/wake never teleports the zoom.
 pub(crate) const FLOATING_ZOOM_MAX_DT: f32 = 0.033;
 /// Minimum floating window inner side in logical points (must match `with_min_inner_size`).
@@ -112,6 +116,8 @@ pub(crate) struct FloatingZoomState {
     pub(crate) monitor_rect: PhysicalRect,
     pub(crate) drawn_w: f32,
     pub(crate) toward_w: f32,
+    /// Log-width spring velocity (log-units/sec) for `C^1` continuous critically damped motion.
+    pub(crate) vel_log: f32,
     pub(crate) pan: (f32, f32),
     /// Latched physical screen cursor `(x, y)` for Stage 2 cursor-anchored zoom; ignored in Stage 1.
     pub(crate) anchor: Option<(i32, i32)>,
@@ -179,6 +185,7 @@ impl FloatingZoomState {
             monitor_rect: init.monitor_rect,
             drawn_w,
             toward_w: drawn_w.clamp(floor_w, ceiling_w),
+            vel_log: 0.0,
             pan,
             anchor: None,
             fit_monitor_w,
@@ -201,14 +208,8 @@ impl FloatingZoomState {
         if anchor.is_some() {
             self.anchor = anchor;
         }
-        let prev_toward = self.toward_w;
         let factor = notch_step_factor(self.per_notch, notches);
-        let mut next = (self.toward_w * factor).clamp(self.floor_w, self.ceiling_w);
-
-        // Detent at cap when zooming back out from Stage 2 so window doesn't unexpectedly shrink on the crossing notch.
-        if notches < 0.0 && prev_toward > self.cap_w && next < self.cap_w {
-            next = self.cap_w;
-        }
+        let next = (self.toward_w * factor).clamp(self.floor_w, self.ceiling_w);
 
         // Unlock inside-window lock once user zooms back to or below the locked window size.
         if self.inside_window_locked && notches < 0.0 && next <= self.cap_w + 0.01 {
@@ -226,35 +227,56 @@ impl FloatingZoomState {
 
     pub(crate) fn is_settled(&self) -> bool {
         (self.toward_w - self.drawn_w).abs() < FLOATING_ZOOM_SETTLED_PX
+            && (self.vel_log.abs() * self.drawn_w) < FLOATING_ZOOM_SETTLED_VEL_PX_PER_SEC
     }
 
-    /// Advances exponential chase by `dt_secs` and evaluates the quantized window + sub-pixel picture rect.
+    /// Advances the exact analytical critically damped log-space spring by `dt_secs`
+    /// (`zeta = 1.0`, zero overshoot, `C^1` continuous velocity, framerate-independent)
+    /// and evaluates the quantized window + sub-pixel picture rect.
     pub(crate) fn step(&mut self, dt_secs: f32) -> FloatingZoomFrame {
         let prev_drawn_w = self.drawn_w;
-        let left = self.toward_w - self.drawn_w;
-        if left.abs() < FLOATING_ZOOM_SETTLED_PX {
+        if self.is_settled() {
             self.drawn_w = self.toward_w;
+            self.vel_log = 0.0;
         } else {
             let dt = dt_secs.clamp(0.0, FLOATING_ZOOM_MAX_DT);
-            let share = 1.0 - FLOATING_ZOOM_RELEASE_LEFT.powf(dt / FLOATING_ZOOM_RELEASE_SECONDS);
-            self.drawn_w = (self.drawn_w + left * share).clamp(self.floor_w, self.ceiling_w);
-            if (self.toward_w - self.drawn_w).abs() < FLOATING_ZOOM_SETTLED_PX {
+            if dt > 0.0 {
+                let x = self.drawn_w.max(1.0).ln();
+                let target = self.toward_w.max(1.0).ln();
+                let x_err = x - target;
+                let omega = FLOATING_ZOOM_SPRING_OMEGA;
+                let decay = (-omega * dt).exp();
+                let c = self.vel_log + omega * x_err;
+                let new_x_err = (x_err + c * dt) * decay;
+                let new_vel = (self.vel_log - omega * c * dt) * decay;
+                let unclamped_w = (target + new_x_err).exp();
+                let clamped_w = unclamped_w.clamp(self.floor_w, self.ceiling_w);
+                self.drawn_w = clamped_w;
+                self.vel_log = if (clamped_w - unclamped_w).abs() > 1e-3 {
+                    0.0
+                } else {
+                    new_vel
+                };
+            }
+            if self.is_settled() {
                 self.drawn_w = self.toward_w;
+                self.vel_log = 0.0;
             }
         }
 
         self.evaluate_frame(prev_drawn_w)
     }
 
-    /// Evaluates current state without advancing chase (used for frame-0 cover on zoom-out entry).
+    /// Evaluates current state without advancing spring (used for frame-0 cover on zoom-out entry).
     pub(crate) fn current_frame(&mut self) -> FloatingZoomFrame {
         self.evaluate_frame(self.drawn_w)
     }
 
-    /// Freezes exponential chase at the exact currently-drawn size when interrupted by user input
+    /// Freezes spring at the exact currently-drawn size when interrupted by user input
     /// so the window never jumps away from the user's cursor.
     pub(crate) fn freeze_for_interrupt(&mut self) -> FloatingZoomFrame {
         self.toward_w = self.drawn_w;
+        self.vel_log = 0.0;
         self.current_frame()
     }
 
@@ -293,17 +315,22 @@ impl FloatingZoomState {
             } else {
                 1.0
             };
-            let home_return_share = if self.drawn_w < prev_drawn_w {
-                home_share(self.drawn_w - win_w, win_w)
-            } else {
-                1.0
-            };
-            let (new_pan_x, new_pan_y) = if home_return_share < 1.0 {
-                // Within the last notch of overhang on zoom-out, smoothly ease pan home to (0, 0) without overshooting.
-                (
-                    self.pan.0 * home_return_share,
-                    self.pan.1 * home_return_share,
-                )
+            let prev_overhang = (prev_drawn_w - self.cap_w).max(0.0);
+            let new_overhang = (self.drawn_w - self.cap_w).max(0.0);
+            let return_zone = win_w * FLOATING_ZOOM_HOME_RETURN_ZONE_FRAC;
+            let in_home_return =
+                self.drawn_w < prev_drawn_w && prev_overhang > 0.0 && new_overhang < return_zone;
+            let (new_pan_x, new_pan_y) = if in_home_return {
+                // Framerate-independent telescoping ratio: `pan` follows `pan_0 * home_share(overhang, win_w)`
+                // identically at 60Hz, 144Hz, and 240Hz, arriving smoothly at `(0, 0)` at `cap_w`.
+                let prev_share = home_share(prev_overhang, win_w);
+                let new_share = home_share(new_overhang, win_w);
+                let ratio = if prev_share > 1e-6 {
+                    (new_share / prev_share).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                (self.pan.0 * ratio, self.pan.1 * ratio)
             } else if let Some((ax, ay)) = self.anchor {
                 let (box_cx, box_cy) = placed.centre_f32();
                 let px = (ax as f32).clamp(placed.left as f32, placed.right as f32);
@@ -714,15 +741,18 @@ pub(crate) fn apply_floating_pan_step_phys(
     (current_offset_pt.0 + dx, current_offset_pt.1 + dy)
 }
 
-/// Smoothstep factor in `[0, 1]` that eases Stage 2 pan back to `(0, 0)` over the last notch
-/// (`10%` of window width) of overhang when zooming out toward the cap.
+/// Monotonic ease factor in `[0, 1]` that returns Stage 2 pan to `(0, 0)` over the final
+/// `25%` of window width of overhang when zooming out toward `cap_w`.
+///
+/// Uses `t^2` (`<= t` on `[0, 1]`) so pan always shrinks at least as fast as overhang (zero
+/// edge black bars even at extreme corners) with zero-velocity arrival at `t = 0`.
 pub(crate) fn home_share(overhang: f32, window: f32) -> f32 {
-    let last = window * (DEFAULT_FLOATING_ZOOM_PER_NOTCH - 1.0);
-    if last <= 0.0 || overhang >= last {
+    let zone = window * FLOATING_ZOOM_HOME_RETURN_ZONE_FRAC;
+    if zone <= 0.0 || overhang >= zone {
         return 1.0;
     }
-    let t = (overhang / last).clamp(0.0, 1.0);
-    t * t * (3.0 - 2.0 * t)
+    let t = (overhang / zone).clamp(0.0, 1.0);
+    t * t
 }
 
 /// True when the displayed image genuinely exceeds the floating window (Stage 2 / zoomed-inside-window),
@@ -1093,10 +1123,12 @@ mod tests {
             "expected uncovered bottom region"
         );
 
-        // Zoom back out: first crossing detents at cap (1440x1080), then shrinks to aspect-locked floor (64x48).
+        // Zoom back out: smoothly crosses Stage 2 -> Stage 1 without catching at cap, shrinking to aspect-locked floor (64x48).
         state.add_notches(-100.0);
-        assert!((state.toward_w - 1440.0).abs() < 1e-2);
-        state.add_notches(-100.0);
+        assert!(
+            state.toward_w < 1440.0,
+            "Stage 2 -> Stage 1 crossing must not detent at cap"
+        );
         for _ in 0..200 {
             frame = state.step(0.016);
         }
@@ -2089,5 +2121,165 @@ mod tests {
             1.0,
             (0.0, 0.0)
         ));
+    }
+
+    #[test]
+    fn critically_damped_log_spring_is_monotonic_silky_and_framerate_independent() {
+        let make_state = || {
+            FloatingZoomState::new(FloatingZoomInit {
+                window_rect: PhysicalRect::new(560, 240, 1360, 840), // 800x600
+                monitor_rect: monitor_1080p(),
+                media_w: 800.0,
+                media_h: 600.0,
+                current_zoom: 1.0,
+                current_offset_pt: (0.0, 0.0),
+                pixels_per_point: 1.0,
+                max_zoom_factor: 10.0,
+                config_zoom_step: 1.02,
+                inside_window_locked: false,
+            })
+            .unwrap()
+        };
+
+        // 1. Single-notch zoom-in: smooth velocity ramp on frame 1 (< 10%, not 32% punch)
+        //    and strictly monotonic with zero overshoot/bounce.
+        let mut s60 = make_state();
+        let start_w = s60.drawn_w;
+        s60.add_notches(1.0);
+        let target_w = s60.toward_w;
+        let notch_delta = target_w - start_w;
+        assert!(notch_delta > 70.0);
+
+        let _ = s60.step(1.0 / 60.0);
+        let frame1_frac = (s60.drawn_w - start_w) / notch_delta;
+        assert!(
+            frame1_frac > 0.005 && frame1_frac < 0.10,
+            "frame 1 must ramp smoothly (< 10% of notch), got {:.3}",
+            frame1_frac
+        );
+
+        let mut prev_w = s60.drawn_w;
+        for _ in 0..120 {
+            let f = s60.step(1.0 / 60.0);
+            assert!(
+                s60.drawn_w >= prev_w - 1e-4,
+                "spring reversed during zoom-in: {} < {}",
+                s60.drawn_w,
+                prev_w
+            );
+            assert!(
+                s60.drawn_w <= target_w + 1e-4,
+                "spring overshot target during zoom-in: {} > {}",
+                s60.drawn_w,
+                target_w
+            );
+            prev_w = s60.drawn_w;
+            if f.settled {
+                break;
+            }
+        }
+        assert!(s60.is_settled());
+        assert!((s60.drawn_w - target_w).abs() < 1e-3);
+
+        // 2. Multi-notch zoom-out: strictly monotonic decreasing with zero undershoot.
+        s60.add_notches(-4.0);
+        let target_out = s60.toward_w;
+        let mut prev_out = s60.drawn_w;
+        for _ in 0..120 {
+            let f = s60.step(1.0 / 60.0);
+            assert!(s60.drawn_w <= prev_out + 1e-4);
+            assert!(s60.drawn_w >= target_out - 1e-4);
+            prev_out = s60.drawn_w;
+            if f.settled {
+                break;
+            }
+        }
+        assert!(s60.is_settled());
+
+        // 3. Framerate independence: 60Hz vs 144Hz match closely at identical elapsed times.
+        let mut a60 = make_state();
+        let mut a144 = make_state();
+        a60.add_notches(3.0);
+        a144.add_notches(3.0);
+        // Advance both by 100ms (6 steps at 60Hz, 14.4 -> check at 5/12s = 25 steps @ 60Hz vs 60 steps @ 144Hz,
+        // and at 1/12s = 5 steps @ 60Hz vs 12 steps @ 144Hz).
+        for _ in 0..5 {
+            let _ = a60.step(1.0 / 60.0);
+        }
+        for _ in 0..12 {
+            let _ = a144.step(1.0 / 144.0);
+        }
+        assert!(
+            (a60.drawn_w - a144.drawn_w).abs() < 0.25,
+            "60Hz ({}) vs 144Hz ({}) diverged at t=83.3ms",
+            a60.drawn_w,
+            a144.drawn_w
+        );
+        for _ in 0..10 {
+            let _ = a60.step(1.0 / 60.0);
+        }
+        for _ in 0..24 {
+            let _ = a144.step(1.0 / 144.0);
+        }
+        assert!(
+            (a60.drawn_w - a144.drawn_w).abs() < 0.25,
+            "60Hz ({}) vs 144Hz ({}) diverged at t=250ms",
+            a60.drawn_w,
+            a144.drawn_w
+        );
+    }
+
+    #[test]
+    fn stage2_home_return_is_framerate_independent_and_crosses_stage1_without_detent() {
+        let make_stage2_state = || {
+            FloatingZoomState::new(FloatingZoomInit {
+                window_rect: PhysicalRect::new(240, 0, 1680, 1080), // 1440x1080 at cap
+                monitor_rect: monitor_1080p(),
+                media_w: 1440.0,
+                media_h: 1080.0,
+                current_zoom: 1.24, // inside 25% return zone above cap_w=1440
+                current_offset_pt: (160.0, -120.0),
+                pixels_per_point: 1.0,
+                max_zoom_factor: 10.0,
+                config_zoom_step: 1.10,
+                inside_window_locked: false,
+            })
+            .unwrap()
+        };
+
+        let mut s60 = make_stage2_state();
+        let mut s144 = make_stage2_state();
+
+        // Zoom out enough to cross Stage 2 -> Stage 1 in one gesture (no detent stuck at cap_w).
+        s60.add_notches(-4.0);
+        s144.add_notches(-4.0);
+        assert!(s60.toward_w < s60.cap_w);
+        assert!(s144.toward_w < s144.cap_w);
+
+        // Compare mid-return at t = 1/12s = 83.33ms (5 steps @ 60Hz vs 12 steps @ 144Hz).
+        for _ in 0..5 {
+            let _ = s60.step(1.0 / 60.0);
+        }
+        for _ in 0..12 {
+            let _ = s144.step(1.0 / 144.0);
+        }
+        assert!(s60.drawn_w > s60.cap_w && s144.drawn_w > s144.cap_w);
+        assert!(
+            (s60.pan.0 - s144.pan.0).abs() < 0.5 && (s60.pan.1 - s144.pan.1).abs() < 0.5,
+            "home_share pan diverged between 60Hz {:?} and 144Hz {:?}",
+            s60.pan,
+            s144.pan
+        );
+
+        // Continue until settled in Stage 1: pan arrives smoothly at (0.0, 0.0).
+        let mut f60 = s60.current_frame();
+        for _ in 0..120 {
+            f60 = s60.step(1.0 / 60.0);
+            if f60.settled {
+                break;
+            }
+        }
+        assert!(f60.settled && !f60.is_stage2);
+        assert_eq!(s60.pan, (0.0, 0.0));
     }
 }

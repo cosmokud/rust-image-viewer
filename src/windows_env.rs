@@ -2159,6 +2159,41 @@ fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
 ///
 /// Only the size is restored; the position the OS chose is kept, then pulled inside the work area
 /// of the display that now holds the window centre, so a restore cannot leave it off screen.
+/// Tracks whether `main_hwnd` received `WM_MOUSELEAVE` without a subsequent `WM_MOUSEMOVE`
+/// (e.g., while `zoom_hwnd` covered `main_hwnd`), so a stationary-cursor click after reveal
+/// can synchronously synthesize `WM_MOUSEMOVE` before forwarding the button message to winit.
+static MAIN_POINTER_GONE: AtomicBool = AtomicBool::new(false);
+
+/// Resynchronizes winit/egui's cursor position on `main_hwnd` after an overlay hides
+/// (such as `zoom_hwnd`), preventing `PointerGone` from dropping stationary-cursor clicks.
+pub fn sync_main_window_cursor_pos(hwnd: HWND) {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::{
+        GetClientRect, GetCursorPos, PostMessageW, ScreenToClient, WM_MOUSEMOVE,
+    };
+
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut pt) == 0 {
+            return;
+        }
+        if ScreenToClient(hwnd, &mut pt) == 0 {
+            return;
+        }
+        let mut rc: RECT = std::mem::zeroed();
+        if GetClientRect(hwnd, &mut rc) == 0 {
+            return;
+        }
+        if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
+            let lparam = ((pt.x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
+            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, lparam);
+        }
+    }
+}
+
 unsafe extern "system" fn scale_change_wndproc(
     hwnd: HWND,
     msg: UINT,
@@ -2167,8 +2202,10 @@ unsafe extern "system" fn scale_change_wndproc(
 ) -> LRESULT {
     use winapi::um::winuser::{
         CallWindowProcW, SC_MAXIMIZE, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND,
-        WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_MOUSEWHEEL, WM_MOVE, WM_SIZE,
-        WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
+        WM_MBUTTONDOWN, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN,
+        WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
+        WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2176,6 +2213,20 @@ unsafe extern "system" fn scale_change_wndproc(
         return def_proc(hwnd, msg, wparam, lparam);
     }
     let previous: WNDPROC = std::mem::transmute(previous);
+
+    if msg == WM_MOUSELEAVE {
+        MAIN_POINTER_GONE.store(true, Ordering::SeqCst);
+    } else if msg == WM_MOUSEMOVE {
+        MAIN_POINTER_GONE.store(false, Ordering::SeqCst);
+    } else if matches!(
+        msg,
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
+    ) && MAIN_POINTER_GONE.swap(false, Ordering::SeqCst)
+    {
+        // Belt-and-suspenders guard: if a click arrives before a posted `WM_MOUSEMOVE` is pumped,
+        // synchronously feed `WM_MOUSEMOVE` first so winit/egui always has exact cursor coords.
+        CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, lparam);
+    }
 
     if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam, lparam) {
         return 0;

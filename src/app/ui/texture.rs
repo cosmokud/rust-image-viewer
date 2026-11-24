@@ -175,6 +175,42 @@ impl ImageViewer {
         true
     }
 
+    /// Converts the live OS cursor position to window-local logical coordinates when egui's
+    /// pointer position is `None` (e.g., right after an overlay hides without mouse movement).
+    pub(crate) fn live_cursor_pos_in_window(
+        &self,
+        ctx: &egui::Context,
+        screen_rect: egui::Rect,
+    ) -> Option<egui::Pos2> {
+        let screen_pos = get_global_cursor_pos()?;
+        let ppp = ctx.pixels_per_point().max(0.01);
+        #[cfg(target_os = "windows")]
+        let local = {
+            let hwnd = self.resolved_main_hwnd();
+            if let Some(r) = crate::windows_env::window_rect(hwnd) {
+                egui::pos2(
+                    (screen_pos.x - r.left as f32) / ppp,
+                    (screen_pos.y - r.top as f32) / ppp,
+                )
+            } else {
+                let outer_min = ctx
+                    .input(|i| i.raw.viewport().outer_rect)
+                    .map(|r| r.min)
+                    .unwrap_or(egui::Pos2::ZERO);
+                screen_pos / ppp - outer_min.to_vec2()
+            }
+        };
+        #[cfg(not(target_os = "windows"))]
+        let local = {
+            let outer_min = ctx
+                .input(|i| i.raw.viewport().outer_rect)
+                .map(|r| r.min)
+                .unwrap_or(egui::Pos2::ZERO);
+            screen_pos / ppp - outer_min.to_vec2()
+        };
+        screen_rect.contains(local).then_some(local)
+    }
+
     /// Handle keyboard and mouse input
     pub(crate) fn handle_input(&mut self, ctx: &egui::Context) {
         if !self.window_allows_keyboard_shortcuts(ctx) {
@@ -234,6 +270,17 @@ impl ImageViewer {
         let mut goto_bound_folder_traverse_requested = false;
         let slider_wheel_guard_active = self.media_slider_wheel_guard_active();
 
+        let live_pointer_fallback = if ctx.input(|i| {
+            i.pointer
+                .interact_pos()
+                .or_else(|| i.pointer.hover_pos())
+                .is_none()
+        }) {
+            self.live_cursor_pos_in_window(ctx, ctx.screen_rect())
+        } else {
+            None
+        };
+
         ctx.input(|input| {
             let ctrl = input.modifiers.ctrl;
             let shift = input.modifiers.shift;
@@ -245,7 +292,8 @@ impl ImageViewer {
             let pointer_pos = input
                 .pointer
                 .interact_pos()
-                .or_else(|| input.pointer.hover_pos());
+                .or_else(|| input.pointer.hover_pos())
+                .or(live_pointer_fallback);
             let pointer_over_shortcut_ui =
                 self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect);
 
@@ -518,7 +566,11 @@ impl ImageViewer {
                     return false;
                 }
 
-                let pointer_pos = input.pointer.hover_pos();
+                let pointer_pos = input
+                    .pointer
+                    .hover_pos()
+                    .or_else(|| input.pointer.interact_pos())
+                    .or(live_pointer_fallback);
                 if self.pointer_over_shortcut_blocking_ui(pointer_pos, input.screen_rect) {
                     return false;
                 }
