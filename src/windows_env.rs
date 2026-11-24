@@ -2160,21 +2160,103 @@ fn settle_chord<F: Fn() -> Option<crate::window_geometry::Rect>>(
 /// Only the size is restored; the position the OS chose is kept, then pulled inside the work area
 /// of the display that now holds the window centre, so a restore cannot leave it off screen.
 /// Tracks whether `main_hwnd` received `WM_MOUSELEAVE` without a subsequent `WM_MOUSEMOVE`
-/// (e.g., while `zoom_hwnd` covered `main_hwnd`), so a stationary-cursor click after reveal
-/// can synchronously synthesize `WM_MOUSEMOVE` before forwarding the button message to winit.
+/// (e.g., while `zoom_hwnd` covered `main_hwnd`), so a stationary-cursor move or click after reveal
+/// can synchronously synthesize a 1px-nudged `WM_MOUSEMOVE` before forwarding to winit.
 static MAIN_POINTER_GONE: AtomicBool = AtomicBool::new(false);
 
+/// Native Win32 primary mouse button events captured directly on `main_hwnd` so floating-mode
+/// double-click detection works even when the cursor never moves a single pixel after zoom.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MainPrimaryMouseEvent {
+    PrimaryDown {
+        screen_pt: (i32, i32),
+        client_pt: (i32, i32),
+        ctrl: bool,
+        shift: bool,
+        alt: bool,
+    },
+    PrimaryUp {
+        screen_pt: (i32, i32),
+        client_pt: (i32, i32),
+    },
+    OtherButtonDown,
+}
+
+static MAIN_PRIMARY_MOUSE_EVENTS: std::sync::Mutex<
+    std::collections::VecDeque<MainPrimaryMouseEvent>,
+> = std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn push_main_primary_mouse_event(event: MainPrimaryMouseEvent) {
+    let mut guard = MAIN_PRIMARY_MOUSE_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if guard.len() >= 64 {
+        guard.pop_front();
+    }
+    guard.push_back(event);
+}
+
+pub fn drain_main_primary_mouse_events() -> Vec<MainPrimaryMouseEvent> {
+    let mut guard = MAIN_PRIMARY_MOUSE_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.drain(..).collect()
+}
+
+pub fn clear_main_primary_mouse_events() {
+    let mut guard = MAIN_PRIMARY_MOUSE_EVENTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard.clear();
+}
+
+#[inline]
+fn pack_client_lparam(x: i32, y: i32) -> LPARAM {
+    ((x as u16 as usize) | ((y as u16 as usize) << 16)) as LPARAM
+}
+
+#[inline]
+fn nudge_client_x(x: i32, min_x: i32, max_x_exclusive: i32) -> i32 {
+    if x > min_x {
+        x - 1
+    } else if x + 1 < max_x_exclusive {
+        x + 1
+    } else {
+        x
+    }
+}
+
+unsafe fn client_lparam_to_screen_point(hwnd: HWND, lparam: LPARAM) -> ((i32, i32), (i32, i32)) {
+    use winapi::shared::windef::POINT;
+    use winapi::um::winuser::{ClientToScreen, GetCursorPos};
+
+    let cx = (lparam & 0xFFFF) as i16 as i32;
+    let cy = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+    let mut screen = POINT { x: cx, y: cy };
+    if ClientToScreen(hwnd, &mut screen) != 0 {
+        ((screen.x, screen.y), (cx, cy))
+    } else {
+        let mut cursor = POINT { x: 0, y: 0 };
+        if GetCursorPos(&mut cursor) != 0 {
+            ((cursor.x, cursor.y), (cx, cy))
+        } else {
+            ((cx, cy), (cx, cy))
+        }
+    }
+}
+
 /// Resynchronizes winit/egui's cursor position on `main_hwnd` after an overlay hides
-/// (such as `zoom_hwnd`), preventing `PointerGone` from dropping stationary-cursor clicks.
+/// (such as `zoom_hwnd`) or after `main_hwnd` resizes under a stationary cursor.
 ///
 /// `winit` does not clear its `last_position` cache on `WM_MOUSELEAVE`, so a single `WM_MOUSEMOVE`
 /// at the unchanged client coordinate would be deduplicated and leave `egui-winit`'s
-/// `pointer_pos_in_points` as `None`. Posting a 1px nudged move immediately followed by the exact
-/// cursor coordinate forces `winit` to emit `CursorMoved` at the exact real position.
+/// `pointer_pos_in_points` as `None`. Delivering a 1px nudged move immediately followed by the
+/// exact cursor coordinate **synchronously** (never `PostMessageW`, which Windows can coalesce)
+/// forces `winit` to emit `CursorMoved` at the exact real position.
 pub fn sync_main_window_cursor_pos(hwnd: HWND) {
     use winapi::shared::windef::POINT;
     use winapi::um::winuser::{
-        GetClientRect, GetCursorPos, PostMessageW, ScreenToClient, WM_MOUSEMOVE,
+        CallWindowProcW, GetClientRect, GetCursorPos, ScreenToClient, SendMessageW, WM_MOUSEMOVE,
     };
 
     if hwnd.is_null() {
@@ -2193,20 +2275,23 @@ pub fn sync_main_window_cursor_pos(hwnd: HWND) {
             return;
         }
         if pt.x >= rc.left && pt.x < rc.right && pt.y >= rc.top && pt.y < rc.bottom {
-            let nudge_x = if pt.x > rc.left {
-                pt.x - 1
-            } else if pt.x + 1 < rc.right {
-                pt.x + 1
+            let nudge_x = nudge_client_x(pt.x, rc.left, rc.right);
+            let nudge_lparam = pack_client_lparam(nudge_x, pt.y);
+            let exact_lparam = pack_client_lparam(pt.x, pt.y);
+            let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
+            if previous != 0 {
+                let previous: WNDPROC = std::mem::transmute(previous);
+                if nudge_lparam != exact_lparam {
+                    CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
+                }
+                CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, exact_lparam);
             } else {
-                pt.x
-            };
-            let nudge_lparam =
-                ((nudge_x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
-            let exact_lparam = ((pt.x as u16 as usize) | ((pt.y as u16 as usize) << 16)) as LPARAM;
-            if nudge_lparam != exact_lparam {
-                let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
+                if nudge_lparam != exact_lparam {
+                    SendMessageW(hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
+                }
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0, exact_lparam);
             }
-            let _ = PostMessageW(hwnd, WM_MOUSEMOVE, 0, exact_lparam);
+            MAIN_POINTER_GONE.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -2218,11 +2303,12 @@ unsafe extern "system" fn scale_change_wndproc(
     lparam: LPARAM,
 ) -> LRESULT {
     use winapi::um::winuser::{
-        CallWindowProcW, SC_MAXIMIZE, WA_INACTIVE, WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND,
-        WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-        WM_MBUTTONDOWN, WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN,
-        WM_SIZE, WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED,
-        WM_WINDOWPOSCHANGING, WM_XBUTTONDOWN,
+        CallWindowProcW, GetKeyState, SC_MAXIMIZE, VK_CONTROL, VK_MENU, VK_SHIFT, WA_INACTIVE,
+        WM_ACTIVATE, WM_DPICHANGED, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP,
+        WM_KILLFOCUS, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
+        WM_MOUSELEAVE, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_MOVE, WM_RBUTTONDOWN, WM_SIZE,
+        WM_SYSCOMMAND, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_WINDOWPOSCHANGED, WM_WINDOWPOSCHANGING,
+        WM_XBUTTONDOWN,
     };
 
     let previous = PREVIOUS_WNDPROC.load(Ordering::SeqCst);
@@ -2234,21 +2320,56 @@ unsafe extern "system" fn scale_change_wndproc(
     if msg == WM_MOUSELEAVE {
         MAIN_POINTER_GONE.store(true, Ordering::SeqCst);
     } else if msg == WM_MOUSEMOVE {
-        MAIN_POINTER_GONE.store(false, Ordering::SeqCst);
+        if MAIN_POINTER_GONE.swap(false, Ordering::SeqCst) {
+            // winit never clears `last_position` on `WM_MOUSELEAVE`. If Windows synthesizes a
+            // `WM_MOUSEMOVE` at the exact same client coordinate (e.g., when `zoom_hwnd` hides),
+            // winit would deduplicate it and leave `egui-winit`'s `pointer_pos_in_points` as None.
+            // Injecting a synchronous 1px nudge first guarantees winit emits `CursorMoved(lparam)`.
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            let nudge_x = if x > 0 { x - 1 } else { x + 1 };
+            let nudge_lparam = pack_client_lparam(nudge_x, y);
+            CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
+        }
     } else if matches!(
         msg,
         WM_LBUTTONDOWN | WM_LBUTTONDBLCLK | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN
     ) && MAIN_POINTER_GONE.swap(false, Ordering::SeqCst)
     {
-        // Belt-and-suspenders guard: if a click arrives before a posted `WM_MOUSEMOVE` is pumped,
-        // synchronously feed a 1px-nudged + exact `WM_MOUSEMOVE` pair first so winit never
-        // deduplicates against its stale `last_position` and egui always has exact cursor coords.
+        // Belt-and-suspenders guard: if a click arrives while `MAIN_POINTER_GONE` is set
+        // (e.g., after a late `WM_MOUSELEAVE` queued before reveal), synchronously feed a
+        // 1px-nudged + exact `WM_MOUSEMOVE` pair first so winit emits `CursorMoved` before
+        // `MouseInput` and egui never drops the click.
         let x = (lparam & 0xFFFF) as i16 as i32;
         let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
         let nudge_x = if x > 0 { x - 1 } else { x + 1 };
-        let nudge_lparam = ((nudge_x as u16 as usize) | ((y as u16 as usize) << 16)) as LPARAM;
+        let nudge_lparam = pack_client_lparam(nudge_x, y);
         CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, nudge_lparam);
         CallWindowProcW(previous, hwnd, WM_MOUSEMOVE, 0, lparam);
+    }
+
+    match msg {
+        WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
+            let (screen_pt, client_pt) = client_lparam_to_screen_point(hwnd, lparam);
+            push_main_primary_mouse_event(MainPrimaryMouseEvent::PrimaryDown {
+                screen_pt,
+                client_pt,
+                ctrl: GetKeyState(VK_CONTROL) < 0,
+                shift: GetKeyState(VK_SHIFT) < 0,
+                alt: GetKeyState(VK_MENU) < 0,
+            });
+        }
+        WM_LBUTTONUP => {
+            let (screen_pt, client_pt) = client_lparam_to_screen_point(hwnd, lparam);
+            push_main_primary_mouse_event(MainPrimaryMouseEvent::PrimaryUp {
+                screen_pt,
+                client_pt,
+            });
+        }
+        WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_XBUTTONDOWN => {
+            push_main_primary_mouse_event(MainPrimaryMouseEvent::OtherButtonDown);
+        }
+        _ => {}
     }
 
     if msg == WM_MOUSEWHEEL && crate::windows_zoom_stage::try_consume_main_wheel(wparam, lparam) {

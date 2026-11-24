@@ -61,6 +61,9 @@ impl ImageViewer {
     pub(crate) fn draw_image(&mut self, ctx: &egui::Context) -> bool {
         // In manga mode, delegate to the manga-specific drawing routine
         if self.mode().is_strip() {
+            self.floating_primary_double_click.clear_all();
+            #[cfg(target_os = "windows")]
+            crate::windows_env::clear_main_primary_mouse_events();
             return self.draw_manga_mode(ctx);
         }
 
@@ -525,88 +528,137 @@ impl ImageViewer {
                 animation_active = true;
             }
 
-            // Split double-click detection: if click 1 landed on `zoom_hwnd` just before reveal
-            // and click 2 lands on `main_hwnd` within the system double-click time and radius,
-            // fire the exact double-click handler and suppress starting a drag/resize on click 2.
+            // Unified native Win32 + zoom-stage primary double-click detection in floating mode:
+            // Tracks raw Win32 primary button events on `main_hwnd` (unified with any click handed
+            // off from `zoom_hwnd`) so stationary-cursor double-clicks immediately after zoom
+            // ALWAYS trigger reliably without depending on egui `hover_pos()` / `PointerMoved`,
+            // while respecting modals, titlebar buttons/text, video seekbar, folder cards, and
+            // modifier keys.
+            let current_item_is_folder_card = self
+                .image_list
+                .get(self.current_index)
+                .is_some_and(|path| self.is_folder_navigation_entry_path(path.as_path()));
             let mut split_double_click_triggered = false;
             if !self.mode().is_fullscreen() {
                 #[cfg(target_os = "windows")]
                 {
                     let ppp = ctx.pixels_per_point().max(0.5);
                     let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
-                    if !primary_down || primary_pressed {
-                        if let Some(press_pt) =
-                            self.pending_zoom_stage_primary_click_candidate.take()
+                    let (sys_interval, dbl_tol) =
+                        crate::windows_zoom_stage::double_click_time_and_tolerance(ppp);
+                    let max_interval = sys_interval.max(Duration::from_secs_f64(
+                        self.config.double_click_grace_period.clamp(0.1, 1.5),
+                    ));
+                    let now = Instant::now();
+                    let title_buttons_zone = self.title_bar_buttons_pointer_zone(ctx, screen_rect);
+                    let static_ui_blocked = title_ui_blocking
+                        || current_item_is_folder_card
+                        || self.any_modal_dialog_open()
+                        || self.file_action_menu.is_some()
+                        || self.is_seeking
+                        || self.is_volume_dragging
+                        || self.gif_seeking
+                        || self.manga_video_seeking;
+                    let ui_blocked_for_client_pt = |client_pt: (i32, i32)| -> bool {
+                        if static_ui_blocked {
+                            return true;
+                        }
+                        let logical_pos =
+                            egui::pos2(client_pt.0 as f32 / ppp, client_pt.1 as f32 / ppp);
+                        if title_buttons_zone.contains(logical_pos) {
+                            return true;
+                        }
+                        let resize_dir = self.get_resize_direction(logical_pos, screen_rect);
+                        if self.show_video_controls
+                            && resize_dir == ResizeDirection::None
+                            && logical_pos.y > screen_rect.height() - 56.0
                         {
-                            let release_pt = crate::windows_zoom_stage::cursor_screen_point()
-                                .unwrap_or(press_pt);
-                            if points_within_tolerance(
-                                press_pt,
-                                release_pt,
-                                click_tol.0,
-                                click_tol.1,
-                            ) {
-                                self.last_zoom_stage_primary_click =
-                                    Some(LastZoomStagePrimaryClick {
-                                        at: Instant::now(),
-                                        screen_pt: press_pt,
-                                    });
-                            }
+                            return true;
+                        }
+                        self.pointer_over_shortcut_blocking_ui(Some(logical_pos), screen_rect)
+                    };
+
+                    let mut tracker = self.floating_primary_double_click;
+                    let drained = crate::windows_env::drain_main_primary_mouse_events();
+                    let pending_down_needs_synthetic_up = tracker.pending_down.is_some()
+                        && ((drained.is_empty() && !primary_down)
+                            || matches!(
+                                drained.first(),
+                                Some(crate::windows_env::MainPrimaryMouseEvent::PrimaryDown { .. })
+                            ));
+                    if pending_down_needs_synthetic_up {
+                        // Handle a press handed off from `zoom_hwnd` whose release completed
+                        // before `main_hwnd` received `WM_LBUTTONUP`.
+                        if let Some(down_pt) = tracker.pending_down {
+                            let release_pt =
+                                crate::windows_zoom_stage::cursor_screen_point().unwrap_or(down_pt);
+                            let client_pt = pointer_pos
+                                .map(|p| ((p.x * ppp).round() as i32, (p.y * ppp).round() as i32))
+                                .unwrap_or_else(|| {
+                                    (
+                                        (screen_rect.width() * 0.5 * ppp).round() as i32,
+                                        (screen_rect.height() * 0.5 * ppp).round() as i32,
+                                    )
+                                });
+                            tracker.process_event(
+                                FloatingPrimaryEvent::Up {
+                                    screen_pt: release_pt,
+                                    client_pt,
+                                },
+                                now,
+                                click_tol,
+                                max_interval,
+                                dbl_tol,
+                                ui_blocked_for_client_pt,
+                            );
                         }
                     }
 
-                    if self.last_zoom_stage_primary_click.is_some() {
-                        let (sys_interval, dbl_tol) =
-                            crate::windows_zoom_stage::double_click_time_and_tolerance(ppp);
-                        let max_interval = sys_interval.max(Duration::from_secs_f64(
-                            self.config.double_click_grace_period.clamp(0.1, 1.5),
-                        ));
-                        let now = Instant::now();
-                        let other_button_pressed = secondary_clicked
-                            || middle_pressed
-                            || ctx.input(|i| {
-                                i.pointer.button_pressed(egui::PointerButton::Secondary)
-                                    || i.pointer.button_pressed(egui::PointerButton::Extra1)
-                                    || i.pointer.button_pressed(egui::PointerButton::Extra2)
-                            });
-                        let expired = self
-                            .last_zoom_stage_primary_click
-                            .is_some_and(|c| now.saturating_duration_since(c.at) > max_interval);
-                        if other_button_pressed || expired {
-                            self.last_zoom_stage_primary_click = None;
-                        } else if primary_pressed
-                            && !ctrl_held
-                            && !shift_held
-                            && !alt_held
-                            && !title_ui_blocking
-                            && !pointer_over_shortcut_ui
-                            && !over_video_controls
-                            && !over_title_bar_buttons
-                        {
-                            if let Some(press_pt) = crate::windows_zoom_stage::cursor_screen_point()
-                            {
-                                if is_split_double_click(
-                                    self.last_zoom_stage_primary_click,
-                                    now,
-                                    press_pt,
-                                    max_interval,
-                                    dbl_tol,
-                                ) {
-                                    self.last_zoom_stage_primary_click = None;
-                                    self.pending_zoom_stage_primary_click_candidate = None;
-                                    split_double_click_triggered = true;
-                                } else {
-                                    self.last_zoom_stage_primary_click = None;
-                                }
-                            } else {
-                                self.last_zoom_stage_primary_click = None;
+                    for ev in drained {
+                        let mapped = match ev {
+                            crate::windows_env::MainPrimaryMouseEvent::PrimaryDown {
+                                screen_pt,
+                                client_pt,
+                                ctrl,
+                                shift,
+                                alt,
+                            } => FloatingPrimaryEvent::Down {
+                                screen_pt,
+                                client_pt,
+                                modifiers: ZoomStageModifiers {
+                                    ctrl: ctrl || ctrl_held,
+                                    shift: shift || shift_held,
+                                    alt: alt || alt_held,
+                                },
+                            },
+                            crate::windows_env::MainPrimaryMouseEvent::PrimaryUp {
+                                screen_pt,
+                                client_pt,
+                            } => FloatingPrimaryEvent::Up {
+                                screen_pt,
+                                client_pt,
+                            },
+                            crate::windows_env::MainPrimaryMouseEvent::OtherButtonDown => {
+                                FloatingPrimaryEvent::OtherButtonDown
                             }
+                        };
+                        if tracker.process_event(
+                            mapped,
+                            now,
+                            click_tol,
+                            max_interval,
+                            dbl_tol,
+                            ui_blocked_for_client_pt,
+                        ) {
+                            split_double_click_triggered = true;
                         }
                     }
+                    self.floating_primary_double_click = tracker;
                 }
             } else {
-                self.last_zoom_stage_primary_click = None;
-                self.pending_zoom_stage_primary_click_candidate = None;
+                self.floating_primary_double_click.clear_all();
+                #[cfg(target_os = "windows")]
+                crate::windows_env::clear_main_primary_mouse_events();
             }
 
             // Handle resize start (but not if over video controls, and never from the
@@ -845,13 +897,25 @@ impl ImageViewer {
             // Called after resize handling to avoid fighting with resize on first click frame.
             self.request_floating_autosize(ctx);
 
-            // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating)
-            let double_clicked = split_double_click_triggered
-                || (ctx.input(|i| {
-                    i.pointer
-                        .button_double_clicked(egui::PointerButton::Primary)
-                }) && !title_ui_blocking
-                    && !pointer_over_shortcut_ui);
+            // Handle double-click to fit media to screen (fullscreen) or reset zoom (floating).
+            // Suppress egui's matching release double-click when the native Win32/split tracker
+            // already fired on click 2 press so a single double-click never double-fires.
+            let egui_double_clicked = ctx.input(|i| {
+                i.pointer
+                    .button_double_clicked(egui::PointerButton::Primary)
+            }) && !title_ui_blocking
+                && !pointer_over_shortcut_ui
+                && !over_title_bar_buttons
+                && !over_video_controls
+                && !current_item_is_folder_card;
+            let double_clicked = if split_double_click_triggered {
+                true
+            } else if egui_double_clicked {
+                self.floating_primary_double_click
+                    .accept_egui_double_click(Instant::now())
+            } else {
+                false
+            };
             if double_clicked {
                 self.reset_view_on_double_click(ctx, screen_rect);
             }

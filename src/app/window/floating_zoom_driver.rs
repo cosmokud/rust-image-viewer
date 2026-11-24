@@ -44,9 +44,10 @@ impl ImageViewer {
     }
 
     pub(crate) fn clear_zoom_stage_click_handoff_state(&mut self) {
-        self.last_zoom_stage_primary_click = None;
-        self.pending_zoom_stage_primary_click_candidate = None;
+        self.floating_primary_double_click.clear_all();
         self.pending_zoom_stage_secondary_press = None;
+        #[cfg(target_os = "windows")]
+        crate::windows_env::clear_main_primary_mouse_events();
     }
 
     pub(crate) fn cancel_floating_zoom_stage_immediately(&mut self) {
@@ -665,6 +666,13 @@ impl ImageViewer {
         // 1. Direct double-click on zoom stage (`WM_LBUTTONDBLCLK`).
         if pending.primary_double_click.is_some() {
             self.clear_zoom_stage_click_handoff_state();
+            let (sys_dbl_interval, _) =
+                crate::windows_zoom_stage::double_click_time_and_tolerance(ppp);
+            let dbl_interval = sys_dbl_interval.max(Duration::from_secs_f64(
+                self.config.double_click_grace_period.clamp(0.1, 1.5),
+            ));
+            self.floating_primary_double_click
+                .note_direct_zoom_stage_double_click(Instant::now(), dbl_interval);
             self.reset_view_on_double_click(ctx, local_rect);
             return;
         }
@@ -743,9 +751,10 @@ impl ImageViewer {
             return;
         }
 
-        // 6. Unmodified primary click completed on zoom stage -> arm split double-click detector.
+        // 6. Unmodified primary click completed on zoom stage -> arm unified double-click detector.
         if let Some(completed) = pending.primary_click_completed {
-            self.last_zoom_stage_primary_click = Some(completed);
+            self.floating_primary_double_click
+                .seed_zoom_stage_click(completed);
         }
 
         // 7. Primary press still held on reveal -> handoff to resize / move / pan, and also track
@@ -760,16 +769,19 @@ impl ImageViewer {
                     let click_tol = crate::windows_zoom_stage::click_drag_tolerance(ppp);
                     if points_within_tolerance(down.screen_pt, release_pt, click_tol.0, click_tol.1)
                     {
-                        self.last_zoom_stage_primary_click = Some(LastZoomStagePrimaryClick {
-                            at: Instant::now(),
-                            screen_pt: down.screen_pt,
-                        });
+                        self.floating_primary_double_click.seed_zoom_stage_click(
+                            LastZoomStagePrimaryClick {
+                                at: Instant::now(),
+                                screen_pt: down.screen_pt,
+                            },
+                        );
                     }
                 }
                 return;
             }
             if !down.modifiers.any() {
-                self.pending_zoom_stage_primary_click_candidate = Some(down.screen_pt);
+                self.floating_primary_double_click
+                    .seed_zoom_stage_pending_down(down.screen_pt);
             }
             self.handoff_pending_primary_drag(
                 ctx,

@@ -665,6 +665,147 @@ impl PendingZoomStageInputs {
     }
 }
 
+/// Native primary button event on `main_hwnd`, fed into `FloatingPrimaryDoubleClickState`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FloatingPrimaryEvent {
+    Down {
+        screen_pt: (i32, i32),
+        client_pt: (i32, i32),
+        modifiers: ZoomStageModifiers,
+    },
+    Up {
+        screen_pt: (i32, i32),
+        client_pt: (i32, i32),
+    },
+    OtherButtonDown,
+}
+
+/// Unified primary double-click tracker across `zoom_hwnd` and `main_hwnd`.
+///
+/// Tracks raw physical screen coordinates and client-space UI-blocking checks directly from
+/// Win32 button events so floating-mode double-click works 100% reliably even when the cursor
+/// never moves a single pixel after zoom, while preventing duplicate firing when `egui` also
+/// emits `button_double_clicked(Primary)` on the matching second-click release.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct FloatingPrimaryDoubleClickState {
+    pub(crate) pending_down: Option<(i32, i32)>,
+    pub(crate) last_click: Option<LastZoomStagePrimaryClick>,
+    pub(crate) suppress_egui_double_click_until: Option<std::time::Instant>,
+}
+
+impl FloatingPrimaryDoubleClickState {
+    pub(crate) fn clear_clicks(&mut self) {
+        self.pending_down = None;
+        self.last_click = None;
+    }
+
+    pub(crate) fn clear_all(&mut self) {
+        self.pending_down = None;
+        self.last_click = None;
+        self.suppress_egui_double_click_until = None;
+    }
+
+    pub(crate) fn seed_zoom_stage_click(&mut self, click: LastZoomStagePrimaryClick) {
+        self.pending_down = None;
+        self.last_click = Some(click);
+    }
+
+    pub(crate) fn seed_zoom_stage_pending_down(&mut self, screen_pt: (i32, i32)) {
+        self.pending_down = Some(screen_pt);
+    }
+
+    pub(crate) fn note_direct_zoom_stage_double_click(
+        &mut self,
+        now: std::time::Instant,
+        double_click_interval: std::time::Duration,
+    ) {
+        self.clear_clicks();
+        self.suppress_egui_double_click_until = Some(now + double_click_interval);
+    }
+
+    /// Processes a single native `main_hwnd` mouse event. Returns `true` if this event completed
+    /// an unblocked primary double-click (firing on click 2 press so click 2 does not start a drag).
+    pub(crate) fn process_event(
+        &mut self,
+        event: FloatingPrimaryEvent,
+        now: std::time::Instant,
+        click_tol: (i32, i32),
+        double_click_interval: std::time::Duration,
+        double_click_tol: (i32, i32),
+        mut ui_blocked_for_client_pt: impl FnMut((i32, i32)) -> bool,
+    ) -> bool {
+        if self
+            .last_click
+            .is_some_and(|last| now.saturating_duration_since(last.at) > double_click_interval)
+        {
+            self.last_click = None;
+        }
+
+        match event {
+            FloatingPrimaryEvent::OtherButtonDown => {
+                self.clear_clicks();
+                false
+            }
+            FloatingPrimaryEvent::Down {
+                screen_pt,
+                client_pt,
+                modifiers,
+            } => {
+                if modifiers.any() || ui_blocked_for_client_pt(client_pt) {
+                    self.clear_clicks();
+                    return false;
+                }
+                if is_split_double_click(
+                    self.last_click,
+                    now,
+                    screen_pt,
+                    double_click_interval,
+                    double_click_tol,
+                ) {
+                    self.clear_clicks();
+                    self.suppress_egui_double_click_until = Some(now + double_click_interval);
+                    true
+                } else {
+                    self.last_click = None;
+                    self.pending_down = Some(screen_pt);
+                    false
+                }
+            }
+            FloatingPrimaryEvent::Up {
+                screen_pt,
+                client_pt,
+            } => {
+                if let Some(down_pt) = self.pending_down.take() {
+                    if !ui_blocked_for_client_pt(client_pt)
+                        && points_within_tolerance(down_pt, screen_pt, click_tol.0, click_tol.1)
+                    {
+                        self.last_click = Some(LastZoomStagePrimaryClick {
+                            at: now,
+                            screen_pt: down_pt,
+                        });
+                    }
+                }
+                false
+            }
+        }
+    }
+
+    /// Returns `true` if an `egui` `button_double_clicked(Primary)` event should fire, or `false`
+    /// if it is the matching release of a double-click already handled natively on click 2 press.
+    pub(crate) fn accept_egui_double_click(&mut self, now: std::time::Instant) -> bool {
+        if let Some(until) = self.suppress_egui_double_click_until {
+            if now <= until {
+                // Consume the single matching egui release suppression.
+                self.suppress_egui_double_click_until = None;
+                return false;
+            }
+            self.suppress_egui_double_click_until = None;
+        }
+        self.clear_clicks();
+        true
+    }
+}
+
 /// True when a primary press on `main_hwnd` completes a split double-click whose first
 /// click landed on `zoom_hwnd` within `max_interval` and `double_click_tol`.
 pub(crate) fn is_split_double_click(
@@ -2434,5 +2575,325 @@ mod tests {
         }
         assert!(f60.settled && !f60.is_stage2);
         assert_eq!(s60.pan, (0.0, 0.0));
+    }
+
+    #[test]
+    fn stationary_double_click_after_zoom_triggers_once_across_all_zoom_modes() {
+        let click_tol = (12, 12);
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
+        let base_t = std::time::Instant::now();
+
+        // Simulate settling after Stage 1 shrink, Stage 1 grow, Stage 1->2, and Stage 2:
+        // In all four cases, the user performs a double-click at a completely stationary
+        // physical screen point (zero mouse movement between reveal, click 1, and click 2).
+        let scenarios = [
+            ("stage1_shrink", -2.0, (960, 540), (200, 150)),
+            ("stage1_grow", 2.0, (960, 540), (500, 380)),
+            ("stage1_to_2", 6.0, (960, 540), (720, 540)),
+            ("stage2_static", 2.0, (960, 540), (720, 540)),
+        ];
+
+        for (name, notches, screen_pt, client_pt) in scenarios {
+            let mut state = FloatingZoomState::new(FloatingZoomInit {
+                window_rect: PhysicalRect::new(560, 240, 1360, 840),
+                monitor_rect: monitor_1080p(),
+                media_w: 800.0,
+                media_h: 600.0,
+                current_zoom: if name == "stage2_static" { 3.0 } else { 1.0 },
+                current_offset_pt: (0.0, 0.0),
+                pixels_per_point: 1.0,
+                max_zoom_factor: 10.0,
+                config_zoom_step: 1.02,
+                inside_window_locked: name == "stage2_static",
+            })
+            .unwrap();
+            state.add_notches_at(notches, Some(screen_pt));
+            for _ in 0..180 {
+                if state.step(1.0 / 60.0).settled {
+                    break;
+                }
+            }
+
+            let mut tracker = FloatingPrimaryDoubleClickState::default();
+            let mut fires = 0usize;
+
+            // Click 1 down + up at exact stationary point (zero mouse movement).
+            if tracker.process_event(
+                FloatingPrimaryEvent::Down {
+                    screen_pt,
+                    client_pt,
+                    modifiers: ZoomStageModifiers::none(),
+                },
+                base_t,
+                click_tol,
+                dbl_interval,
+                dbl_tol,
+                |_| false,
+            ) {
+                fires += 1;
+            }
+            if tracker.process_event(
+                FloatingPrimaryEvent::Up {
+                    screen_pt,
+                    client_pt,
+                },
+                base_t + std::time::Duration::from_millis(40),
+                click_tol,
+                dbl_interval,
+                dbl_tol,
+                |_| false,
+            ) {
+                fires += 1;
+            }
+            assert_eq!(fires, 0, "{name}: click 1 must not fire double-click");
+
+            // Click 2 down at exact same stationary point -> must fire immediately.
+            let t2 = base_t + std::time::Duration::from_millis(160);
+            if tracker.process_event(
+                FloatingPrimaryEvent::Down {
+                    screen_pt,
+                    client_pt,
+                    modifiers: ZoomStageModifiers::none(),
+                },
+                t2,
+                click_tol,
+                dbl_interval,
+                dbl_tol,
+                |_| false,
+            ) {
+                fires += 1;
+            }
+            assert_eq!(fires, 1, "{name}: click 2 press must fire exactly once");
+
+            // Click 2 release + matching egui `button_double_clicked(Primary)` must NOT double-fire!
+            let t2_up = t2 + std::time::Duration::from_millis(35);
+            if tracker.process_event(
+                FloatingPrimaryEvent::Up {
+                    screen_pt,
+                    client_pt,
+                },
+                t2_up,
+                click_tol,
+                dbl_interval,
+                dbl_tol,
+                |_| false,
+            ) {
+                fires += 1;
+            }
+            if tracker.accept_egui_double_click(t2_up) {
+                fires += 1;
+            }
+            assert_eq!(
+                fires, 1,
+                "{name}: single double-click must never double-fire on egui release"
+            );
+        }
+    }
+
+    #[test]
+    fn double_click_on_top_bar_seekbar_modal_or_with_modifiers_never_resets_view() {
+        let click_tol = (12, 12);
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let dbl_tol = (12, 12);
+        let t0 = std::time::Instant::now();
+
+        // Client area 800x600: top-right titlebar buttons at x >= 680 && y <= 36;
+        // bottom video seekbar at y > 544.
+        let is_over_chrome = |(cx, cy): (i32, i32)| (cx >= 680 && cy <= 36) || cy > 544;
+
+        // 1. Top bar buttons
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (1200, 110),
+                client_pt: (740, 16),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Up {
+                screen_pt: (1200, 110),
+                client_pt: (740, 16),
+            },
+            t0 + std::time::Duration::from_millis(30),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (1200, 110),
+                client_pt: (740, 16),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0 + std::time::Duration::from_millis(120),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+
+        // 2. Video seekbar at bottom
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 680),
+                client_pt: (400, 570),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Up {
+                screen_pt: (800, 680),
+                client_pt: (400, 570),
+            },
+            t0 + std::time::Duration::from_millis(30),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 680),
+                client_pt: (400, 570),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0 + std::time::Duration::from_millis(120),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            is_over_chrome,
+        ));
+
+        // 3. Modal open (all client points blocked)
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| true,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Up {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+            },
+            t0 + std::time::Duration::from_millis(30),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| true,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0 + std::time::Duration::from_millis(120),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| true,
+        ));
+
+        // 4. Modifier held on click 2 cancels double-click
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0,
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| false,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Up {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+            },
+            t0 + std::time::Duration::from_millis(30),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| false,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+                modifiers: ZoomStageModifiers {
+                    ctrl: true,
+                    shift: false,
+                    alt: false,
+                },
+            },
+            t0 + std::time::Duration::from_millis(120),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| false,
+        ));
+
+        // 5. Intervening right-click cancels pending left click sequence
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        tracker.seed_zoom_stage_click(LastZoomStagePrimaryClick {
+            at: t0,
+            screen_pt: (800, 400),
+        });
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::OtherButtonDown,
+            t0 + std::time::Duration::from_millis(50),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| false,
+        ));
+        assert!(!tracker.process_event(
+            FloatingPrimaryEvent::Down {
+                screen_pt: (800, 400),
+                client_pt: (400, 300),
+                modifiers: ZoomStageModifiers::none(),
+            },
+            t0 + std::time::Duration::from_millis(120),
+            click_tol,
+            dbl_interval,
+            dbl_tol,
+            |_| false,
+        ));
+    }
+
+    #[test]
+    fn direct_zoom_stage_double_click_suppresses_matching_egui_release_once() {
+        let dbl_interval = std::time::Duration::from_millis(500);
+        let t0 = std::time::Instant::now();
+        let mut tracker = FloatingPrimaryDoubleClickState::default();
+        tracker.note_direct_zoom_stage_double_click(t0, dbl_interval);
+        assert!(!tracker.accept_egui_double_click(t0 + std::time::Duration::from_millis(40)));
+        // A later independent egui double-click is accepted normally.
+        assert!(tracker.accept_egui_double_click(t0 + std::time::Duration::from_millis(300)));
     }
 }
