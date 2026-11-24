@@ -24,6 +24,7 @@ pub(crate) struct FloatingZoomSession {
     pub(crate) state: FloatingZoomState,
     pub(crate) phase: FloatingZoomPhase,
     pub(crate) main_cloaked: bool,
+    pub(crate) pending_primary_drag: Option<PendingPrimaryDrag>,
 }
 
 impl ImageViewer {
@@ -197,6 +198,7 @@ impl ImageViewer {
                 last_commit: now,
             },
             main_cloaked: true,
+            pending_primary_drag: None,
         });
         ctx.request_repaint();
         true
@@ -227,6 +229,8 @@ impl ImageViewer {
             return;
         }
 
+        let captured_drag = crate::windows_zoom_stage::take_pending_primary_drag()
+            .map(|press_screen_pt| PendingPrimaryDrag { press_screen_pt });
         let stage_interrupt = crate::windows_zoom_stage::take_interrupt();
         let focus_lost = !ctx.input(|i| i.focused);
         let key_pressed = ctx.input(|i| {
@@ -235,7 +239,8 @@ impl ImageViewer {
                 .iter()
                 .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
         });
-        let soft_interrupt = stage_interrupt || focus_lost || key_pressed;
+        let soft_interrupt =
+            stage_interrupt || captured_drag.is_some() || focus_lost || key_pressed;
 
         let main_hwnd = self.resolved_main_hwnd();
         if main_hwnd.is_null() {
@@ -249,8 +254,18 @@ impl ImageViewer {
             None => return,
         };
 
+        if let Some(drag) = captured_drag {
+            session.pending_primary_drag = Some(drag);
+        } else if focus_lost {
+            session.pending_primary_drag = None;
+        }
+        if session.pending_primary_drag.is_some() && !global_mouse_button_down(GLOBAL_MOUSE_LEFT) {
+            session.pending_primary_drag = None;
+        }
+
         // If new wheel input arrives during Settling (and not interrupted), immediately resume Travelling.
         if !soft_interrupt
+            && session.pending_primary_drag.is_none()
             && matches!(session.phase, FloatingZoomPhase::Settling { .. })
             && crate::windows_zoom_stage::peek_wheel_delta() != 0
         {
@@ -266,17 +281,29 @@ impl ImageViewer {
                 mut last_tick,
                 mut last_commit,
             } => {
+                if soft_interrupt {
+                    // Freeze right where the user interrupted/grabbed it and immediately start
+                    // settling `main_hwnd` in this same frame so reveal happens with minimal delay.
+                    let frame = session.state.freeze_for_interrupt();
+                    session.phase = self.begin_settling_main_window(
+                        ctx,
+                        main_hwnd,
+                        &session.state,
+                        frame.window_rect,
+                    );
+                    self.floating_zoom_session = Some(session);
+                    ctx.request_repaint();
+                    return;
+                }
+
                 let (raw_delta, wheel_cursor) =
                     crate::windows_zoom_stage::take_wheel_delta_and_cursor();
-                if raw_delta != 0 && !soft_interrupt {
+                if raw_delta != 0 {
                     let cursor =
                         wheel_cursor.or_else(crate::windows_zoom_stage::cursor_screen_point);
                     session
                         .state
                         .add_notches_at(raw_delta as f32 / 120.0, cursor);
-                }
-                if soft_interrupt {
-                    session.state.toward_w = session.state.drawn_w;
                 }
 
                 // Adaptive VSync guard: if cloaked SwapBuffers returned immediately (< 2ms), pace via DwmFlush
@@ -298,12 +325,12 @@ impl ImageViewer {
                 last_commit = Instant::now();
 
                 if frame.settled && crate::windows_zoom_stage::peek_wheel_delta() == 0 {
-                    session.phase = FloatingZoomPhase::Settling {
-                        target_rect: frame.window_rect,
-                        resized_main: false,
-                        matched_frames: 0,
-                        started_at: Instant::now(),
-                    };
+                    session.phase = self.begin_settling_main_window(
+                        ctx,
+                        main_hwnd,
+                        &session.state,
+                        frame.window_rect,
+                    );
                 } else {
                     session.phase = FloatingZoomPhase::Travelling {
                         last_tick,
@@ -315,43 +342,18 @@ impl ImageViewer {
             }
             FloatingZoomPhase::Settling {
                 target_rect,
-                mut resized_main,
+                resized_main,
                 mut matched_frames,
                 started_at,
             } => {
                 let ppp = ctx.pixels_per_point().max(0.01);
                 if !resized_main {
-                    let (zoom, (ox, oy)) = session.state.to_eframe_state(ppp);
-                    self.zoom = zoom;
-                    self.zoom_target = zoom;
-                    self.zoom_velocity = 0.0;
-                    self.offset = egui::vec2(ox, oy);
-                    self.floating_zoom_inside_window_locked = session.state.inside_window_locked;
-                    self.pending_viewer_rect = None;
-                    self.transition_cover = None;
-                    self.transition_cover_waits = 0;
-                    crate::windows_env::clear_posted_window_rect();
-                    self.maybe_refresh_current_solo_image_lod();
-
-                    let zoom_hwnd = self
-                        .zoom_stage_window
-                        .as_ref()
-                        .map_or(std::ptr::null_mut(), |s| s.hwnd());
-                    crate::windows_zoom_stage::place_main_under_stage(
+                    session.phase = self.begin_settling_main_window(
+                        ctx,
                         main_hwnd,
-                        zoom_hwnd,
-                        target_rect.left,
-                        target_rect.top,
-                        target_rect.width(),
-                        target_rect.height(),
-                    );
-                    resized_main = true;
-                    session.phase = FloatingZoomPhase::Settling {
+                        &session.state,
                         target_rect,
-                        resized_main,
-                        matched_frames,
-                        started_at,
-                    };
+                    );
                     self.floating_zoom_session = Some(session);
                     ctx.request_repaint();
                 } else {
@@ -368,6 +370,9 @@ impl ImageViewer {
                     }
 
                     if matched_frames >= 2 || started_at.elapsed() >= Duration::from_millis(150) {
+                        let pending_drag = crate::windows_zoom_stage::take_pending_primary_drag()
+                            .map(|press_screen_pt| PendingPrimaryDrag { press_screen_pt })
+                            .or(session.pending_primary_drag);
                         self.floating_zoom_settled_zoom = Some(self.zoom);
                         crate::windows_env::set_window_cloaked(main_hwnd, false);
                         crate::windows_zoom_stage::dwm_flush();
@@ -375,6 +380,12 @@ impl ImageViewer {
                             stage.hide();
                         }
                         crate::windows_zoom_stage::set_zoom_capture_armed(false, false);
+                        self.handoff_pending_primary_drag(
+                            ctx,
+                            main_hwnd,
+                            target_rect,
+                            pending_drag,
+                        );
                         ctx.request_repaint();
                     } else {
                         session.phase = FloatingZoomPhase::Settling {
@@ -387,6 +398,150 @@ impl ImageViewer {
                         ctx.request_repaint();
                     }
                 }
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn begin_settling_main_window(
+        &mut self,
+        ctx: &egui::Context,
+        main_hwnd: winapi::shared::windef::HWND,
+        state: &FloatingZoomState,
+        target_rect: PhysicalRect,
+    ) -> FloatingZoomPhase {
+        let ppp = ctx.pixels_per_point().max(0.01);
+        let (zoom, (ox, oy)) = state.to_eframe_state(ppp);
+        self.zoom = zoom;
+        self.zoom_target = zoom;
+        self.zoom_velocity = 0.0;
+        self.offset = egui::vec2(ox, oy);
+        self.floating_zoom_inside_window_locked = state.inside_window_locked;
+        self.pending_viewer_rect = None;
+        self.transition_cover = None;
+        self.transition_cover_waits = 0;
+        crate::windows_env::clear_posted_window_rect();
+        self.maybe_refresh_current_solo_image_lod();
+
+        let rect_already_matches = crate::windows_env::window_rect(main_hwnd).is_some_and(|r| {
+            r.left == target_rect.left
+                && r.top == target_rect.top
+                && r.right == target_rect.right
+                && r.bottom == target_rect.bottom
+        });
+        let screen_px = ctx.screen_rect().size() * ppp;
+        let client_already_matches = rect_already_matches
+            && crate::windows_zoom_stage::client_size(main_hwnd).is_some_and(|(cw, ch)| {
+                (cw - target_rect.width()).abs() <= 1
+                    && (ch - target_rect.height()).abs() <= 1
+                    && (screen_px.x - cw as f32).abs() <= 1.0
+                    && (screen_px.y - ch as f32).abs() <= 1.0
+            });
+
+        if !rect_already_matches {
+            let zoom_hwnd = self
+                .zoom_stage_window
+                .as_ref()
+                .map_or(std::ptr::null_mut(), |s| s.hwnd());
+            crate::windows_zoom_stage::place_main_under_stage(
+                main_hwnd,
+                zoom_hwnd,
+                target_rect.left,
+                target_rect.top,
+                target_rect.width(),
+                target_rect.height(),
+            );
+        }
+
+        // `drive_floating_zoom_stage` runs before `draw_image` in the same frame: if `main_hwnd`
+        // already has the exact target size (e.g., Phase 2 static window), this frame's `draw_image`
+        // paints the updated `(zoom, offset)` and swaps, so the very next frame can reveal immediately.
+        let matched_frames = if client_already_matches { 1 } else { 0 };
+        FloatingZoomPhase::Settling {
+            target_rect,
+            resized_main: true,
+            matched_frames,
+            started_at: Instant::now(),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn handoff_pending_primary_drag(
+        &mut self,
+        ctx: &egui::Context,
+        main_hwnd: winapi::shared::windef::HWND,
+        target_rect: PhysicalRect,
+        pending_drag: Option<PendingPrimaryDrag>,
+    ) {
+        let primary_still_down = global_mouse_button_down(GLOBAL_MOUSE_LEFT);
+        if !primary_still_down || self.mode().is_fullscreen() {
+            return;
+        }
+        let Some(drag) = pending_drag else {
+            return;
+        };
+
+        let ppp = ctx.pixels_per_point().max(0.01);
+        let win_w_pt = target_rect.width().max(1) as f32 / ppp;
+        let win_h_pt = target_rect.height().max(1) as f32 / ppp;
+        let local_press_pt = egui::pos2(
+            (drag.press_screen_pt.0 - target_rect.left) as f32 / ppp,
+            (drag.press_screen_pt.1 - target_rect.top) as f32 / ppp,
+        );
+        let local_rect =
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(win_w_pt, win_h_pt));
+        let resize_dir = self.get_resize_direction(local_press_pt, local_rect);
+        if resize_dir != ResizeDirection::None {
+            crate::windows_zoom_stage::ensure_foreground(main_hwnd);
+            self.is_resizing = true;
+            self.resize_direction = resize_dir;
+            self.last_mouse_pos = None;
+            self.resize_start_outer_pos = None;
+            self.resize_start_inner_size = None;
+            self.resize_start_cursor_screen = None;
+            self.resize_last_size = None;
+            return;
+        }
+
+        let image_exceeds_window = self.image_display_size_at_zoom().is_some_and(|size| {
+            floating_image_exceeds_window_size((size.x, size.y), (win_w_pt, win_h_pt), ppp)
+        });
+        let primary_pan_bound = self.action_uses_binding(Action::Pan, InputBinding::MouseLeft);
+        let Some(takeover) = resolve_floating_zoom_drag_takeover(
+            Some(drag),
+            primary_still_down,
+            primary_pan_bound,
+            self.mode().is_fullscreen(),
+            target_rect,
+            image_exceeds_window,
+        ) else {
+            return;
+        };
+
+        crate::windows_zoom_stage::ensure_foreground(main_hwnd);
+        match takeover {
+            FloatingZoomDragTakeover::MoveWindow {
+                start_outer_phys,
+                start_cursor_phys,
+            } => {
+                self.is_panning = true;
+                self.pan_drag_button = Some(egui::PointerButton::Primary);
+                self.pan_drag_moves_window = true;
+                self.floating_drag_start_outer_pos =
+                    Some(egui::pos2(start_outer_phys.0, start_outer_phys.1));
+                self.floating_drag_start_cursor_screen =
+                    Some(egui::pos2(start_cursor_phys.0, start_cursor_phys.1));
+                self.pan_last_cursor_phys = None;
+                self.last_mouse_pos = None;
+            }
+            FloatingZoomDragTakeover::PanImage { start_cursor_phys } => {
+                self.is_panning = true;
+                self.pan_drag_button = Some(egui::PointerButton::Primary);
+                self.pan_drag_moves_window = false;
+                self.reset_floating_window_drag_anchor();
+                self.pan_last_cursor_phys =
+                    Some(egui::pos2(start_cursor_phys.0, start_cursor_phys.1));
+                self.last_mouse_pos = None;
             }
         }
     }

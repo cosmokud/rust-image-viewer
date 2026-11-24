@@ -2,8 +2,8 @@
 
 /// Default per-notch multiplier matching `rust-hover-preview` and prior ~5-frame `smooth_scroll_delta` feel.
 pub(crate) const DEFAULT_FLOATING_ZOOM_PER_NOTCH: f32 = 1.10;
-/// Settle threshold in physical pixels: prevents infinite sub-pixel chasing.
-pub(crate) const FLOATING_ZOOM_SETTLED_PX: f32 = 0.25;
+/// Settle threshold in physical pixels: snaps sub-pixel exponential tail cleanly.
+pub(crate) const FLOATING_ZOOM_SETTLED_PX: f32 = 0.5;
 /// Exponential chase time constant: 90% of remaining travel in 100ms.
 pub(crate) const FLOATING_ZOOM_RELEASE_SECONDS: f32 = 0.1;
 const FLOATING_ZOOM_RELEASE_LEFT: f32 = 0.1;
@@ -254,6 +254,13 @@ impl FloatingZoomState {
         self.evaluate_frame(self.drawn_w)
     }
 
+    /// Freezes exponential chase at the exact currently-drawn size when interrupted by user input
+    /// so the window never jumps away from the user's cursor.
+    pub(crate) fn freeze_for_interrupt(&mut self) -> FloatingZoomFrame {
+        self.toward_w = self.drawn_w;
+        self.current_frame()
+    }
+
     fn evaluate_frame(&mut self, prev_drawn_w: f32) -> FloatingZoomFrame {
         let raw_w_f = self.drawn_w.min(self.cap_w).max(1.0);
         let raw_h_f = (raw_w_f * self.aspect).max(1.0);
@@ -352,6 +359,71 @@ impl FloatingZoomState {
             (zoom, (self.pan.0 / ppp, self.pan.1 / ppp))
         }
     }
+}
+
+/// Physical screen coordinates of a primary mouse button press captured while the
+/// floating zoom stage covered `main_hwnd`, awaiting handoff to window drag or image pan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PendingPrimaryDrag {
+    pub(crate) press_screen_pt: (i32, i32),
+}
+
+/// Action to engage immediately on reveal when a primary mouse press was captured on `zoom_hwnd`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FloatingZoomDragTakeover {
+    /// Phase 1: move the floating window anchored at physical `(start_outer_phys, start_cursor_phys)`.
+    MoveWindow {
+        start_outer_phys: (f32, f32),
+        start_cursor_phys: (f32, f32),
+    },
+    /// Phase 2: pan the zoomed image inside the window anchored at physical `start_cursor_phys`.
+    PanImage { start_cursor_phys: (f32, f32) },
+}
+
+/// Resolves whether a captured `PendingPrimaryDrag` should engage Phase 1 window move,
+/// Phase 2 image pan, or nothing (e.g., if LMB was already released before reveal).
+pub(crate) fn resolve_floating_zoom_drag_takeover(
+    pending: Option<PendingPrimaryDrag>,
+    primary_still_down: bool,
+    primary_pan_bound: bool,
+    is_fullscreen: bool,
+    target_rect: PhysicalRect,
+    image_exceeds_window: bool,
+) -> Option<FloatingZoomDragTakeover> {
+    if is_fullscreen || !primary_still_down || !primary_pan_bound {
+        return None;
+    }
+    let PendingPrimaryDrag { press_screen_pt } = pending?;
+    let start_cursor_phys = (press_screen_pt.0 as f32, press_screen_pt.1 as f32);
+    if image_exceeds_window {
+        Some(FloatingZoomDragTakeover::PanImage { start_cursor_phys })
+    } else {
+        Some(FloatingZoomDragTakeover::MoveWindow {
+            start_outer_phys: (target_rect.left as f32, target_rect.top as f32),
+            start_cursor_phys,
+        })
+    }
+}
+
+/// Applies one physical-pixel cursor delta to floating-mode image pan offset (in logical points),
+/// clamping so the image always covers the window (0px black bars) across any DPI scale.
+pub(crate) fn apply_floating_pan_step_phys(
+    current_offset_pt: (f32, f32),
+    prev_cursor_phys: (f32, f32),
+    current_cursor_phys: (f32, f32),
+    pixels_per_point: f32,
+    display_size_pt: (f32, f32),
+    window_size_pt: (f32, f32),
+) -> (f32, f32) {
+    let ppp = pixels_per_point.max(0.01);
+    let dx = (current_cursor_phys.0 - prev_cursor_phys.0) / ppp;
+    let dy = (current_cursor_phys.1 - prev_cursor_phys.1) / ppp;
+    let max_x = ((display_size_pt.0 - window_size_pt.0) * 0.5).max(0.0);
+    let max_y = ((display_size_pt.1 - window_size_pt.1) * 0.5).max(0.0);
+    (
+        (current_offset_pt.0 + dx).clamp(-max_x, max_x),
+        (current_offset_pt.1 + dy).clamp(-max_y, max_y),
+    )
 }
 
 /// Smoothstep factor in `[0, 1]` that eases Stage 2 pan back to `(0, 0)` over the last notch
@@ -1157,5 +1229,172 @@ mod tests {
         }
         assert!(frame.settled && !frame.is_stage2);
         assert_eq!(resumed.pan, (0.0, 0.0));
+    }
+
+    #[test]
+    fn interrupt_freezes_chase_and_resolves_phase1_phase2_or_released_takeover() {
+        let mut state = FloatingZoomState::new(FloatingZoomInit {
+            window_rect: PhysicalRect::new(560, 240, 1360, 840), // 800x600
+            monitor_rect: monitor_1080p(),
+            media_w: 800.0,
+            media_h: 600.0,
+            current_zoom: 1.0,
+            current_offset_pt: (0.0, 0.0),
+            pixels_per_point: 1.0,
+            max_zoom_factor: 10.0,
+            config_zoom_step: 1.10,
+            inside_window_locked: false,
+        })
+        .unwrap();
+
+        // Start a multi-notch zoom and advance one frame (mid-Travelling).
+        state.add_notches(5.0);
+        let mid = state.step(0.016);
+        assert!(!mid.settled);
+        assert!(state.toward_w > state.drawn_w + 50.0);
+
+        // Interrupt freezes chase right where the user grabbed it (no teleport).
+        let drawn_before_freeze = state.drawn_w;
+        let frozen = state.freeze_for_interrupt();
+        assert!(frozen.settled);
+        assert_eq!(state.drawn_w, drawn_before_freeze);
+        assert_eq!(state.toward_w, drawn_before_freeze);
+        assert_eq!(frozen.window_rect, mid.window_rect);
+
+        let pending = Some(PendingPrimaryDrag {
+            press_screen_pt: (900, 500),
+        });
+
+        // Phase 1 (image fits window) -> MoveWindow anchored at frozen window origin & press point.
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(
+                pending,
+                true,
+                true,
+                false,
+                frozen.window_rect,
+                false,
+            ),
+            Some(FloatingZoomDragTakeover::MoveWindow {
+                start_outer_phys: (
+                    frozen.window_rect.left as f32,
+                    frozen.window_rect.top as f32
+                ),
+                start_cursor_phys: (900.0, 500.0),
+            })
+        );
+
+        // Phase 2 (image exceeds window) -> PanImage anchored at press point.
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(
+                pending,
+                true,
+                true,
+                false,
+                frozen.window_rect,
+                true,
+            ),
+            Some(FloatingZoomDragTakeover::PanImage {
+                start_cursor_phys: (900.0, 500.0),
+            })
+        );
+
+        // Released before reveal -> None (never sticks mouse button down).
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(
+                pending,
+                false,
+                true,
+                false,
+                frozen.window_rect,
+                false,
+            ),
+            None
+        );
+
+        // Unbound primary pan / fullscreen / no pending drag -> None.
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(
+                pending,
+                true,
+                false,
+                false,
+                frozen.window_rect,
+                false,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(
+                pending,
+                true,
+                true,
+                true,
+                frozen.window_rect,
+                true,
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_floating_zoom_drag_takeover(None, true, true, false, frozen.window_rect, true),
+            None
+        );
+    }
+
+    #[test]
+    fn phase2_global_cursor_pan_delta_and_clamping_across_dpi_scales() {
+        for &ppp in &[1.0f32, 1.25, 1.5, 2.0] {
+            let win_pt = (1000.0 / ppp, 800.0 / ppp);
+            let display_pt = (1400.0 / ppp, 1200.0 / ppp);
+            let max_x = (display_pt.0 - win_pt.0) * 0.5;
+            let max_y = (display_pt.1 - win_pt.1) * 0.5;
+
+            // Zero movement -> zero jump.
+            let o0 = apply_floating_pan_step_phys(
+                (10.0, -5.0),
+                (500.0, 400.0),
+                (500.0, 400.0),
+                ppp,
+                display_pt,
+                win_pt,
+            );
+            assert!((o0.0 - 10.0).abs() < 1e-4 && (o0.1 - (-5.0)).abs() < 1e-4);
+
+            // Physical delta scales cleanly by 1 / ppp.
+            let o1 = apply_floating_pan_step_phys(
+                (0.0, 0.0),
+                (500.0, 400.0),
+                (550.0, 360.0),
+                ppp,
+                display_pt,
+                win_pt,
+            );
+            assert!((o1.0 - 50.0 / ppp).abs() < 1e-4);
+            assert!((o1.1 - (-40.0 / ppp)).abs() < 1e-4);
+
+            // Extreme drag clamps strictly to image overhang -> 0px black bars.
+            let clamped = apply_floating_pan_step_phys(
+                o1,
+                (550.0, 360.0),
+                (5550.0, -4640.0),
+                ppp,
+                display_pt,
+                win_pt,
+            );
+            assert!((clamped.0 - max_x).abs() < 1e-4);
+            assert!((clamped.1 - (-max_y)).abs() < 1e-4);
+
+            // Reversing direction from clamped edge moves immediately (no dead zone).
+            let backed = apply_floating_pan_step_phys(
+                clamped,
+                (5550.0, -4640.0),
+                (5530.0, -4620.0),
+                ppp,
+                display_pt,
+                win_pt,
+            );
+            assert!((backed.0 - (max_x - 20.0 / ppp)).abs() < 1e-4);
+            assert!((backed.1 - (-max_y + 20.0 / ppp)).abs() < 1e-4);
+        }
     }
 }

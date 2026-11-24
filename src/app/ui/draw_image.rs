@@ -410,6 +410,7 @@ impl ImageViewer {
                         };
                     self.is_panning = false;
                     self.last_mouse_pos = None;
+                    self.pan_last_cursor_phys = None;
                 }
                 animation_active = true;
             }
@@ -534,6 +535,7 @@ impl ImageViewer {
                             floating_image_exceeds_window,
                         );
                         self.last_mouse_pos = pointer_pos;
+                        self.pan_last_cursor_phys = get_global_cursor_pos();
                         self.reset_floating_window_drag_anchor();
                     }
 
@@ -557,18 +559,47 @@ impl ImageViewer {
                         _ => cursor_delta,
                     };
 
-                    if let Some(cursor) = cursor_points {
-                        if self.mode().is_fullscreen() {
-                            self.reset_floating_window_drag_anchor();
+                    if self.mode().is_fullscreen() {
+                        self.reset_floating_window_drag_anchor();
+                        self.pan_last_cursor_phys = None;
+                        if let Some(cursor) = cursor_points {
                             // In fullscreen, pan the image
                             self.offset += drag_delta;
                             self.remember_current_fullscreen_view_state();
-                        } else if self.pan_drag_moves_window {
-                            // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
-                            self.drag_floating_window_without_native_snap(ctx);
-                        } else {
-                            self.reset_floating_window_drag_anchor();
-                            // In floating mode when zoomed past window, pan image inside window (clamped: 0px black bars).
+                            self.last_mouse_pos = Some(cursor);
+                        }
+                    } else if self.pan_drag_moves_window {
+                        self.pan_last_cursor_phys = None;
+                        // In floating mode, bypass native StartDrag to avoid Win11 top-edge snap.
+                        self.drag_floating_window_without_native_snap(ctx);
+                        if let Some(cursor) = cursor_points {
+                            self.last_mouse_pos = Some(cursor);
+                        }
+                    } else {
+                        self.reset_floating_window_drag_anchor();
+                        // In floating mode when zoomed past window, pan image inside window (clamped: 0px black bars).
+                        // Prefer OS physical cursor coordinates so panning works seamlessly even if the press was
+                        // handed off from the layered zoom stage (without egui seeing WM_LBUTTONDOWN) or if the
+                        // cursor leaves the window without Win32 capture.
+                        if let Some(current_phys) = get_global_cursor_pos() {
+                            if let Some(prev_phys) = self.pan_last_cursor_phys {
+                                if let Some(display_size) = self.image_display_size_at_zoom() {
+                                    let (ox, oy) = apply_floating_pan_step_phys(
+                                        (self.offset.x, self.offset.y),
+                                        (prev_phys.x, prev_phys.y),
+                                        (current_phys.x, current_phys.y),
+                                        ctx.pixels_per_point(),
+                                        (display_size.x, display_size.y),
+                                        (screen_rect.width(), screen_rect.height()),
+                                    );
+                                    self.offset = egui::vec2(ox, oy);
+                                } else {
+                                    let ppp = ctx.pixels_per_point().max(0.01);
+                                    self.offset += (current_phys - prev_phys) / ppp;
+                                }
+                            }
+                            self.pan_last_cursor_phys = Some(current_phys);
+                        } else if cursor_points.is_some() {
                             self.offset += drag_delta;
                             if let Some(display_size) = self.image_display_size_at_zoom() {
                                 let max_x = ((display_size.x - screen_rect.width()) * 0.5).max(0.0);
@@ -578,9 +609,9 @@ impl ImageViewer {
                                 self.offset.y = self.offset.y.clamp(-max_y, max_y);
                             }
                         }
-                        self.last_mouse_pos = Some(cursor);
-                    } else if self.pan_drag_moves_window && !self.mode().is_fullscreen() {
-                        self.drag_floating_window_without_native_snap(ctx);
+                        if let Some(cursor) = cursor_points {
+                            self.last_mouse_pos = Some(cursor);
+                        }
                     }
 
                     ctx.set_cursor_icon(egui::CursorIcon::Grabbing);
@@ -592,6 +623,7 @@ impl ImageViewer {
                         self.is_panning = false;
                     }
                     self.last_mouse_pos = None;
+                    self.pan_last_cursor_phys = None;
                     self.pan_drag_button = None;
                     self.pan_drag_moves_window = false;
                     self.reset_floating_window_drag_anchor();

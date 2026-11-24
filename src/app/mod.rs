@@ -311,6 +311,10 @@ pub(crate) struct ImageViewer {
     pub(crate) is_panning: bool,
     /// Last mouse position for panning
     pub(crate) last_mouse_pos: Option<egui::Pos2>,
+    /// Last physical screen cursor position (`GetCursorPos` units) for Phase 2 floating image pan.
+    /// Allows smooth, zero-jump panning even when handed off from the layered zoom stage or when
+    /// the cursor moves outside `main_hwnd` without Win32 mouse capture.
+    pub(crate) pan_last_cursor_phys: Option<egui::Pos2>,
     /// Which pointer button started the current pan/window drag (if any).
     /// Once held, that button alone keeps the drag alive: egui drops the pointer
     /// (`hover_pos()` becomes `None`) as soon as the cursor leaves the window, which
@@ -1108,6 +1112,7 @@ impl Default for ImageViewer {
             offset: egui::Vec2::ZERO,
             is_panning: false,
             last_mouse_pos: None,
+            pan_last_cursor_phys: None,
             pan_drag_button: None,
             pan_drag_moves_window: false,
             last_pointer_hover_pos: None,

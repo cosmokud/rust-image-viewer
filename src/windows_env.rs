@@ -2185,6 +2185,7 @@ unsafe extern "system" fn scale_change_wndproc(
         && (msg == WM_KILLFOCUS
             || (msg == WM_ACTIVATE && (wparam & 0xFFFF) == WA_INACTIVE as WPARAM))
     {
+        crate::windows_zoom_stage::clear_pending_primary_drag();
         crate::windows_zoom_stage::signal_interrupt();
     }
 

@@ -14,13 +14,14 @@ use winapi::um::wingdi::{
     AC_SRC_OVER, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, BLENDFUNCTION, DIB_RGB_COLORS,
 };
 use winapi::um::winuser::{
-    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos, GetKeyState,
-    GetWindow, GetWindowLongPtrW, LoadCursorW, RegisterClassExW, SetCursor, SetWindowPos,
-    ShowWindow, UpdateLayeredWindow, GWL_EXSTYLE, GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP,
-    HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL, MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA, VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN,
-    WM_MBUTTONDOWN, WM_MOUSEACTIVATE, WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN,
-    WNDCLASSEXW, WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+    CreateWindowExW, DefWindowProcW, DestroyWindow, GetClientRect, GetCursorPos,
+    GetForegroundWindow, GetKeyState, GetWindow, GetWindowLongPtrW, LoadCursorW, RegisterClassExW,
+    SetCursor, SetForegroundWindow, SetWindowPos, ShowWindow, UpdateLayeredWindow, GWL_EXSTYLE,
+    GW_HWNDPREV, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IDC_ARROW, MA_NOACTIVATE, MK_CONTROL,
+    MK_SHIFT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SW_HIDE, SW_SHOWNOACTIVATE, ULW_ALPHA,
+    VK_MENU, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MOUSEACTIVATE,
+    WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_SETCURSOR, WM_XBUTTONDOWN, WNDCLASSEXW, WS_EX_LAYERED,
+    WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
 const ZOOM_STAGE_CLASS: &str = "RustImageViewerZoomStage";
@@ -37,6 +38,9 @@ static ZOOM_WHEEL_CURSOR: AtomicU64 = AtomicU64::new(0);
 static ZOOM_WHEEL_CURSOR_VALID: AtomicBool = AtomicBool::new(false);
 /// Set on pointer button press over `zoom_hwnd` or focus loss to trigger immediate settle/handoff.
 static ZOOM_INTERRUPT: AtomicBool = AtomicBool::new(false);
+/// Packed physical screen `(x, y)` of a `WM_LBUTTONDOWN` captured on `zoom_hwnd` for seamless drag/pan handoff.
+static PENDING_PRIMARY_DRAG_PT: AtomicU64 = AtomicU64::new(0);
+static PENDING_PRIMARY_DRAG_VALID: AtomicBool = AtomicBool::new(false);
 /// Cloned `egui::Context` so WndProc hooks can wake an idle winit/eframe loop immediately.
 static EGUI_CTX: Mutex<Option<egui::Context>> = Mutex::new(None);
 
@@ -80,6 +84,28 @@ pub fn signal_interrupt() {
     request_egui_repaint();
 }
 
+pub fn clear_pending_primary_drag() {
+    PENDING_PRIMARY_DRAG_VALID.store(false, Ordering::SeqCst);
+}
+
+pub fn take_pending_primary_drag() -> Option<(i32, i32)> {
+    if PENDING_PRIMARY_DRAG_VALID.swap(false, Ordering::SeqCst) {
+        let packed = PENDING_PRIMARY_DRAG_PT.load(Ordering::SeqCst);
+        Some((packed as u32 as i32, (packed >> 32) as u32 as i32))
+    } else {
+        None
+    }
+}
+
+fn record_primary_drag_press() {
+    if let Some((x, y)) = cursor_screen_point() {
+        let packed = (x as u32 as u64) | ((y as u32 as u64) << 32);
+        PENDING_PRIMARY_DRAG_PT.store(packed, Ordering::SeqCst);
+        PENDING_PRIMARY_DRAG_VALID.store(true, Ordering::SeqCst);
+    }
+    signal_interrupt();
+}
+
 pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
     ZOOM_CAPTURE_CTRL_WHEEL.store(allow_ctrl_wheel, Ordering::SeqCst);
     ZOOM_CAPTURE_ARMED.store(armed, Ordering::SeqCst);
@@ -87,6 +113,7 @@ pub fn set_zoom_capture_armed(armed: bool, allow_ctrl_wheel: bool) {
         ZOOM_WHEEL_DELTA.store(0, Ordering::SeqCst);
         ZOOM_WHEEL_CURSOR_VALID.store(false, Ordering::SeqCst);
         ZOOM_INTERRUPT.store(false, Ordering::SeqCst);
+        PENDING_PRIMARY_DRAG_VALID.store(false, Ordering::SeqCst);
     }
 }
 
@@ -170,7 +197,16 @@ unsafe extern "system" fn zoom_stage_wndproc(
             }
             0
         }
-        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONDBLCLK | WM_XBUTTONDOWN => {
+        WM_LBUTTONDOWN => {
+            record_primary_drag_press();
+            0
+        }
+        WM_LBUTTONUP => {
+            clear_pending_primary_drag();
+            0
+        }
+        WM_RBUTTONDOWN | WM_MBUTTONDOWN | WM_LBUTTONDBLCLK | WM_XBUTTONDOWN => {
+            clear_pending_primary_drag();
             signal_interrupt();
             0
         }
@@ -476,5 +512,16 @@ pub(crate) fn client_size(hwnd: HWND) -> Option<(i32, i32)> {
 pub(crate) fn dwm_flush() {
     unsafe {
         winapi::um::dwmapi::DwmFlush();
+    }
+}
+
+pub(crate) fn ensure_foreground(hwnd: HWND) {
+    if hwnd.is_null() {
+        return;
+    }
+    unsafe {
+        if GetForegroundWindow() != hwnd {
+            SetForegroundWindow(hwnd);
+        }
     }
 }
