@@ -54,6 +54,7 @@ pub(crate) struct MangaTextureEntry {
     pub(crate) width: u32,
     pub(crate) height: u32,
     pub(crate) media_type: MangaMediaType,
+    pub(crate) mipmap_deferred: bool,
 }
 
 impl MangaTextureCache {
@@ -205,6 +206,57 @@ impl MangaTextureCache {
                 .is_some_and(|entry| entry.path.as_path() == path)
     }
 
+    pub(crate) fn peek_texture_mipmap_info_for_path(
+        &self,
+        index: usize,
+        path: &Path,
+    ) -> Option<(u32, u32, MangaMediaType, bool)> {
+        self.pinned_entries
+            .get(&index)
+            .and_then(|entry| {
+                (entry.path.as_path() == path).then_some((
+                    entry.width,
+                    entry.height,
+                    entry.media_type,
+                    entry.mipmap_deferred,
+                ))
+            })
+            .or_else(|| {
+                self.unpinned_entries.peek(&index).and_then(|entry| {
+                    (entry.path.as_path() == path).then_some((
+                        entry.width,
+                        entry.height,
+                        entry.media_type,
+                        entry.mipmap_deferred,
+                    ))
+                })
+            })
+    }
+
+    pub fn is_mipmap_deferred_for_path(&self, index: usize, path: &Path) -> bool {
+        self.peek_texture_mipmap_info_for_path(index, path)
+            .is_some_and(|(_, _, _, deferred)| deferred)
+    }
+
+    pub fn clear_mipmap_deferred_for_path(&mut self, index: usize, path: &Path) -> bool {
+        if let Some(entry) = self.pinned_entries.get_mut(&index) {
+            if entry.path.as_path() == path && entry.mipmap_deferred {
+                entry.mipmap_deferred = false;
+                return true;
+            }
+            return false;
+        }
+
+        if let Some(entry) = self.unpinned_entries.peek_mut(&index) {
+            if entry.path.as_path() == path && entry.mipmap_deferred {
+                entry.mipmap_deferred = false;
+                return true;
+            }
+        }
+
+        false
+    }
+
     /// Insert a texture into the cache with explicit media type.
     /// Returns evicted indices if cache was full.
     pub fn insert_with_type(
@@ -216,12 +268,30 @@ impl MangaTextureCache {
         height: u32,
         media_type: MangaMediaType,
     ) -> Vec<usize> {
+        self.insert_with_type_with_mipmap_deferred(
+            index, path, texture, width, height, media_type, false,
+        )
+    }
+
+    /// Insert a texture into the cache with explicit media type and whether mipmap generation
+    /// was deferred due to active navigation. Returns evicted indices if cache was full.
+    pub fn insert_with_type_with_mipmap_deferred(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+        media_type: MangaMediaType,
+        mipmap_deferred: bool,
+    ) -> Vec<usize> {
         let entry = MangaTextureEntry {
             path,
             texture,
             width,
             height,
             media_type,
+            mipmap_deferred,
         };
 
         if self.pinned_indices.contains(&index) {
@@ -252,6 +322,7 @@ impl MangaTextureCache {
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
+            entry.mipmap_deferred = false;
             return true;
         }
 
@@ -262,6 +333,7 @@ impl MangaTextureCache {
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
+            entry.mipmap_deferred = false;
             return true;
         }
 

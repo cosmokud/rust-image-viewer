@@ -133,6 +133,13 @@ impl MangaLoader {
             .is_some_and(|state| state.attempts >= PRELOAD_RETRY_MAX_ATTEMPTS)
     }
 
+    /// True while `index` is waiting out a post-failure backoff window before its next attempt.
+    pub fn retry_waiting(&self, index: usize, now: Instant) -> bool {
+        self.retry_state.read().get(&index).is_some_and(|state| {
+            state.attempts < PRELOAD_RETRY_MAX_ATTEMPTS && now < state.next_retry_at
+        })
+    }
+
     /// Highest level the loader believes is loaded for `index` (may be set with no texture).
     pub fn loaded_level_for(&self, index: usize) -> Option<u32> {
         self.loaded_levels.read().get(&index).copied()

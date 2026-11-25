@@ -38,24 +38,8 @@ impl ImageViewer {
                 let force_flush = !self.masonry_metadata_preload_active;
                 self.masonry_flush_pending_dimension_updates(force_flush);
             }
-        } else if let Some(min_deferred_idx) = self.manga_strip_deferred_dim_min_idx {
-            let nav_active = self.manga_navigation_active_for_heavy_work();
-            let viewport_near_deferred = if nav_active && self.manga_total_height_cache_valid {
-                let viewport_bottom_idx = self.manga_index_at_y(
-                    self.manga_scroll_offset.max(0.0) + self.screen_size.y.max(1.0),
-                );
-                viewport_bottom_idx.saturating_add(4) >= min_deferred_idx
-            } else {
-                false
-            };
-            if !nav_active || viewport_near_deferred {
-                let anchor = self.manga_capture_scroll_anchor();
-                self.invalidate_manga_layout_cache();
-                if let Some(anchor) = anchor {
-                    self.manga_apply_scroll_anchor(anchor);
-                    self.manga_update_current_index();
-                }
-            }
+        } else {
+            self.manga_flush_deferred_strip_dims_if_needed();
         }
 
         if self.mode().is_masonry() && self.masonry_metadata_preload_active {
@@ -955,6 +939,14 @@ impl ImageViewer {
             self.last_manga_scroll_tick = None;
         }
 
+        // Flush any deferred Long Strip dimension updates right on the frame scroll snaps to rest.
+        if !self.mode().is_masonry()
+            && self.manga_strip_deferred_dim_min_idx.is_some()
+            && !self.manga_navigation_active_for_heavy_work()
+        {
+            self.manga_flush_deferred_strip_dims_if_needed();
+        }
+
         let strip_navigation_active_for_visible_retry = self.is_panning
             || self.mark_selection_box.is_some()
             || self.manga_zoom_plus_held
@@ -1382,6 +1374,13 @@ impl ImageViewer {
         if self.mode().is_masonry() && self.masonry_metadata_overlay_visible() {
             self.draw_masonry_metadata_loading_overlay(ctx);
         }
+
+        let (deferred_mipmap_retry, deferred_mipmap_pending) =
+            self.manga_tick_deferred_mipmap_upgrades(&visible_indices_buf);
+        if deferred_mipmap_retry {
+            requested_visible_retry = true;
+        }
+        self.manga_visible_mipmap_upgrade_pending = deferred_mipmap_pending;
 
         if requested_visible_retry {
             animation_active = true;

@@ -294,6 +294,17 @@ impl UploadPolicy {
     pub fn mipmap_enabled(&self, size: (u32, u32)) -> bool {
         wants_mipmap(self, size)
     }
+
+    /// True when mipmaps were suppressed solely due to temporary navigation or budget gating.
+    pub fn mipmap_deferred(&self, size: (u32, u32)) -> bool {
+        if self.mipmap_enabled(size) {
+            return false;
+        }
+        let mut settled = *self;
+        settled.navigation_active = false;
+        settled.frame_budget_tight = false;
+        settled.mipmap_enabled(size)
+    }
 }
 
 fn wants_mipmap(policy: &UploadPolicy, size: (u32, u32)) -> bool {
@@ -642,5 +653,29 @@ mod tests {
 
         let mismatched = rgba_vec_to_color_image((2, 2), vec![255; 8]);
         assert!(mismatched.pixels.is_empty());
+    }
+
+    #[test]
+    fn mipmap_deferred_tracks_only_temporary_gating() {
+        let mut policy = inputs();
+        policy.display_min_side = 500.0;
+        policy.navigation_active = true;
+        let nav_policy = policy.policy(UploadKind::MangaPage);
+        assert!(!nav_policy.mipmap_enabled((1000, 1000)));
+        assert!(nav_policy.mipmap_deferred((1000, 1000)));
+
+        // Not deferred when mipmaps would stay disabled at rest (not minified enough or disallowed).
+        assert!(!nav_policy.mipmap_deferred((520, 520)));
+        policy.mipmap_static = false;
+        assert!(!policy
+            .policy(UploadKind::MangaPage)
+            .mipmap_deferred((1000, 1000)));
+
+        // Not deferred once settled (mipmaps are enabled directly).
+        policy.mipmap_static = true;
+        policy.navigation_active = false;
+        let settled_policy = policy.policy(UploadKind::MangaPage);
+        assert!(settled_policy.mipmap_enabled((1000, 1000)));
+        assert!(!settled_policy.mipmap_deferred((1000, 1000)));
     }
 }

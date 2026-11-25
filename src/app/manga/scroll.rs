@@ -261,6 +261,7 @@ impl ImageViewer {
         self.last_manga_scroll_tick = None;
         self.manga_scroll_frame_dt_s = None;
         self.manga_strip_deferred_dim_min_idx = None;
+        self.manga_visible_mipmap_upgrade_pending = false;
         self.manga_demand_last_visible.clear();
         self.masonry_navigation_was_active = false;
         self.masonry_quality_refine_due_at = None;

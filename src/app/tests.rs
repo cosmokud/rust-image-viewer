@@ -1533,3 +1533,209 @@ pub(crate) fn upload_budgets_and_active_scroll_gating_scale_with_refresh_rate() 
         assert!(settled_policy.mipmap_enabled((4096, 4096)));
     }
 }
+
+fn make_test_decoded_page(index: usize, path: PathBuf, width: u32, height: u32) -> DecodedImage {
+    let pixel_count = (width as usize) * (height as usize);
+    DecodedImage {
+        index,
+        path,
+        color_image: egui::ColorImage {
+            size: [width as usize, height as usize],
+            pixels: vec![egui::Color32::from_rgb(180, 120, 60); pixel_count],
+        },
+        width,
+        height,
+        original_width: width,
+        original_height: height,
+        requested_side: width.max(height),
+        media_type: MangaMediaType::StaticImage,
+        deferred: false,
+        queue_wait: Duration::ZERO,
+        decode_time: Duration::ZERO,
+        resize_time: Duration::ZERO,
+    }
+}
+
+#[test]
+pub(crate) fn long_strip_deferred_mipmaps_upgrade_on_settle_one_per_frame_without_idle_spin() {
+    let mut viewer = long_strip_scroll_test_viewer(4);
+    viewer.screen_size = egui::vec2(1000.0, 700.0);
+    // Scroll slightly past 0 so both page 0 (0..700) and page 1 (700..1400) intersect viewport.
+    viewer.manga_scroll_offset = 100.0;
+    viewer.manga_scroll_target = 100.0;
+    viewer.config.use_hardware_acceleration = true;
+    viewer.config.manga_mipmap_static = true;
+    viewer.config.manga_mipmap_min_side = 128;
+    viewer.max_texture_side = 2048;
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for idx in 0..4 {
+            loader
+                .dimension_cache
+                .insert(idx, (1000, 1500, MangaMediaType::StaticImage));
+            loader.loaded_levels.write().insert(idx, 1500);
+        }
+    }
+
+    let ctx = egui::Context::default();
+    let paths: Vec<PathBuf> = viewer.image_list.clone();
+
+    // 1) Initial upload during active Long Strip scroll: mipmaps are deferred on cached entries.
+    viewer.manga_wheel_scroll_active = true;
+    assert!(viewer.manga_navigation_active_for_heavy_work());
+    for idx in 0..2 {
+        viewer
+            .manga_decoded_mailbox
+            .push_back(make_test_decoded_page(idx, paths[idx].clone(), 1000, 1500));
+        viewer.manga_process_pending_loads(&ctx);
+        assert!(
+            viewer
+                .manga_texture_cache
+                .is_mipmap_deferred_for_path(idx, paths[idx].as_path()),
+            "page {idx} uploaded mid-scroll must record mipmap_deferred"
+        );
+    }
+
+    // While still scrolling, deferred-mipmap upgrade work stays paused.
+    assert_eq!(
+        viewer.manga_tick_deferred_mipmap_upgrades(&[0, 1]),
+        (false, false)
+    );
+
+    // 2) Scroll settles: upgrades queue at most 1 visible deferred page per frame.
+    viewer.manga_wheel_scroll_active = false;
+    assert!(!viewer.manga_navigation_active_for_heavy_work());
+    let (queued, pending) = viewer.manga_tick_deferred_mipmap_upgrades(&[0, 1]);
+    assert!(queued, "settled frame should queue first deferred page");
+    assert!(pending, "app_loop must keep polling while upgrades remain");
+    assert_eq!(
+        viewer
+            .manga_loader
+            .as_ref()
+            .and_then(|l| l.loaded_level_for(1)),
+        Some(1500),
+        "second visible deferred page must wait for budget (1 per frame)"
+    );
+    viewer.manga_visible_mipmap_upgrade_pending = pending;
+    assert!(viewer.manga_should_fast_poll_background(false, 0, 0));
+
+    // 3) Same-dimension payloads finishing decode while settled upgrade at most 1 per frame,
+    // clearing `mipmap_deferred` without dropping the second item from the mailbox.
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(0, paths[0].clone(), 1000, 1500));
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(1, paths[1].clone(), 1000, 1500));
+    viewer.manga_process_pending_loads(&ctx);
+    assert!(
+        !viewer
+            .manga_texture_cache
+            .is_mipmap_deferred_for_path(0, paths[0].as_path()),
+        "page 0 should now have mipmaps enabled"
+    );
+    assert!(
+        viewer
+            .manga_texture_cache
+            .is_mipmap_deferred_for_path(1, paths[1].as_path()),
+        "page 1 upgrade stays deferred until next pass (1 per frame)"
+    );
+    assert_eq!(viewer.manga_decoded_mailbox.len(), 1);
+
+    // Next pass upgrades page 1 cleanly; afterward settled visible state stops polling completely.
+    viewer.manga_process_pending_loads(&ctx);
+    assert!(!viewer
+        .manga_texture_cache
+        .is_mipmap_deferred_for_path(1, paths[1].as_path()));
+    let (queued_after, pending_after) = viewer.manga_tick_deferred_mipmap_upgrades(&[0, 1]);
+    assert!(!queued_after);
+    assert!(!pending_after);
+    viewer.manga_visible_mipmap_upgrade_pending = pending_after;
+    assert!(!viewer.manga_should_fast_poll_background(false, 0, 0));
+
+    // 4) Unloadable or policy-disabled deferred entries clear cleanly without idle spin.
+    viewer.manga_scroll_offset = 1400.0;
+    viewer.manga_scroll_target = 1400.0;
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(2, paths[2].clone(), 1000, 1500));
+    viewer.manga_wheel_scroll_active = true;
+    viewer.manga_process_pending_loads(&ctx);
+    assert!(viewer
+        .manga_texture_cache
+        .is_mipmap_deferred_for_path(2, paths[2].as_path()));
+    viewer.manga_wheel_scroll_active = false;
+    viewer.config.manga_mipmap_static = false;
+    assert_eq!(
+        viewer.manga_tick_deferred_mipmap_upgrades(&[2]),
+        (false, false)
+    );
+    assert!(!viewer
+        .manga_texture_cache
+        .is_mipmap_deferred_for_path(2, paths[2].as_path()));
+}
+
+#[test]
+pub(crate) fn long_strip_deferred_dims_flush_on_settle_and_prevent_park() {
+    let mut viewer = long_strip_scroll_test_viewer(20);
+    viewer.screen_size = egui::vec2(1920.0, 1080.0);
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        loader
+            .dimension_cache
+            .insert(18, (1080, 400, MangaMediaType::StaticImage));
+    }
+    viewer.invalidate_manga_layout_cache();
+    let initial_total = viewer.manga_total_height();
+    assert!(viewer.manga_total_height_cache_valid);
+
+    // On settle frame before `manga_tick_scroll_animation` snaps: nav_active is still true,
+    // so early draw check defers layout flush while keeping app_loop pending-layout wake armed.
+    viewer.manga_scroll_offset = 0.0;
+    viewer.manga_scroll_target = 0.4;
+    viewer.manga_scroll_velocity = 1.0;
+    assert!(viewer.manga_navigation_active_for_heavy_work());
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        loader
+            .dimension_cache
+            .insert(18, (1080, 900, MangaMediaType::StaticImage));
+    }
+    viewer.manga_strip_deferred_dim_min_idx = Some(18);
+
+    assert!(!viewer.manga_flush_deferred_strip_dims_if_needed());
+    assert_eq!(viewer.manga_strip_deferred_dim_min_idx, Some(18));
+    assert!(viewer.manga_pending_layout_flush_needed());
+
+    // `manga_tick_scroll_animation` snaps scroll within threshold to rest and returns false.
+    assert!(!viewer.manga_tick_scroll_animation(1.0 / 144.0));
+    assert!(!viewer.manga_navigation_active_for_heavy_work());
+
+    // Post-tick flush clears deferred dims immediately and updates cached strip height (+500px).
+    assert!(viewer.manga_flush_deferred_strip_dims_if_needed());
+    assert_eq!(viewer.manga_strip_deferred_dim_min_idx, None);
+    assert!(!viewer.manga_pending_layout_flush_needed());
+    assert!((viewer.manga_total_height() - (initial_total + 500.0)).abs() < 1e-2);
+
+    // Outside Long Strip (Masonry / Solo), stale strip deferred index does not trigger strip flush.
+    viewer.manga_strip_deferred_dim_min_idx = Some(5);
+    set_test_mode(&mut viewer, Mode::Strip(MangaLayoutMode::Masonry));
+    assert!(!viewer.manga_pending_layout_flush_needed());
+    assert!(!viewer.manga_flush_deferred_strip_dims_if_needed());
+}
+
+#[test]
+pub(crate) fn manga_upload_catchup_gates_when_strip_focused_video_plays() {
+    let mut viewer = long_strip_scroll_test_viewer(4);
+    assert!(viewer.manga_should_catchup_uploads_with_playback(false, true, 0));
+    assert!(viewer.manga_should_catchup_uploads_with_playback(false, false, 2));
+    assert!(!viewer.manga_should_catchup_uploads_with_playback(true, true, 2));
+
+    viewer.manga_visible_mipmap_upgrade_pending = true;
+    assert!(viewer.manga_should_fast_poll_background(false, 0, 0));
+
+    // Solo mode never engages manga upload catchup or fast-poll background work.
+    set_test_mode(
+        &mut viewer,
+        Mode::FullscreenSolo(MangaLayoutMode::LongStrip),
+    );
+    assert!(!viewer.manga_should_catchup_uploads_with_playback(false, true, 2));
+    assert!(!viewer.manga_should_fast_poll_background(false, 0, 0));
+}

@@ -748,6 +748,8 @@ pub(crate) struct ImageViewer {
     pub(crate) masonry_layout_invalidation_deferred: bool,
     /// Smallest Long Strip item index whose dimension update was deferred mid-scroll.
     pub(crate) manga_strip_deferred_dim_min_idx: Option<usize>,
+    /// True while settled visible manga pages still have deferred mipmaps upgrading.
+    pub(crate) manga_visible_mipmap_upgrade_pending: bool,
     /// Pending masonry dimension updates waiting to be committed into layout.
     pub(crate) masonry_pending_dimension_updates: HashSet<usize>,
     /// Reusable per-frame scratch buffers to avoid hot-path allocations.
@@ -1348,6 +1350,7 @@ impl Default for ImageViewer {
             masonry_layout_valid: false,
             masonry_layout_invalidation_deferred: false,
             manga_strip_deferred_dim_min_idx: None,
+            manga_visible_mipmap_upgrade_pending: false,
             masonry_pending_dimension_updates: HashSet::new(),
             manga_visible_indices_scratch: Vec::new(),
             manga_visible_indices_draw_scratch: Vec::new(),

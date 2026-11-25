@@ -128,4 +128,157 @@ impl ImageViewer {
 
         use_rtree
     }
+
+    /// Upgrades settled visible textures whose mipmaps were suppressed mid-scroll.
+    /// Bounded to at most one deferred-mipmap upgrade in flight or queued per frame.
+    /// Returns `(queued_retry_this_frame, any_visible_upgrade_pending)`.
+    pub(crate) fn manga_tick_deferred_mipmap_upgrades(
+        &mut self,
+        visible: &[usize],
+    ) -> (bool, bool) {
+        if !self.mode().is_manga() || self.mode().is_solo() || self.image_list.is_empty() {
+            return (false, false);
+        }
+        if self.manga_navigation_active_for_heavy_work() || self.manga_strip_focused_video_playing()
+        {
+            return (false, false);
+        }
+        if self.mode().is_masonry()
+            && (self.masonry_navigation_was_active
+                || self.masonry_quality_refine_due_at.is_some()
+                || self.masonry_quality_refine_frames_remaining > 0
+                || self.masonry_metadata_preload_active)
+        {
+            return (false, false);
+        }
+
+        let now = Instant::now();
+        let max_side = self.max_texture_side.max(1);
+        let mut queued_retry = false;
+        let mut in_progress = false;
+        let mut still_pending = false;
+
+        for &idx in visible {
+            let Some(path) = self.image_list.get(idx).cloned() else {
+                continue;
+            };
+            let Some((tex_w, tex_h, media_type, mipmap_deferred)) = self
+                .manga_texture_cache
+                .peek_texture_mipmap_info_for_path(idx, path.as_path())
+            else {
+                continue;
+            };
+            if !mipmap_deferred {
+                continue;
+            }
+
+            let video_thumb_allowed = media_type != MangaMediaType::Video
+                || gstreamer_runtime_available()
+                || cfg!(target_os = "windows");
+            let retry_blocked = self.manga_media_is_unloadable(idx)
+                || self
+                    .manga_loader
+                    .as_ref()
+                    .is_some_and(|loader| loader.retry_blocked(idx));
+            if media_type == MangaMediaType::AnimatedImage || !video_thumb_allowed || retry_blocked
+            {
+                self.manga_texture_cache
+                    .clear_mipmap_deferred_for_path(idx, path.as_path());
+                continue;
+            }
+
+            let settled_policy =
+                self.manga_upload_policy_with_nav(idx, media_type, (tex_w, tex_h), false);
+            if !settled_policy.mipmap_enabled((tex_w, tex_h)) {
+                self.manga_texture_cache
+                    .clear_mipmap_deferred_for_path(idx, path.as_path());
+                continue;
+            }
+
+            if self
+                .manga_decoded_mailbox
+                .iter()
+                .any(|decoded| decoded.index == idx && decoded.path == path)
+            {
+                in_progress = true;
+                still_pending = true;
+                continue;
+            }
+
+            if self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.is_index_in_flight(idx))
+            {
+                in_progress = true;
+                still_pending = true;
+                continue;
+            }
+
+            if self
+                .manga_loader
+                .as_ref()
+                .is_some_and(|loader| loader.retry_waiting(idx, now))
+            {
+                continue;
+            }
+
+            if queued_retry || in_progress {
+                still_pending = true;
+                continue;
+            }
+
+            let raw_target_side = if self.mode().is_masonry() {
+                let display_size = self
+                    .masonry_item_current_display_size(idx)
+                    .unwrap_or_else(|| egui::vec2(tex_w.max(1) as f32, tex_h.max(1) as f32));
+                self.manga_bucket_side_covering_rect(
+                    idx,
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, display_size),
+                )
+            } else {
+                let display_size = self.manga_strip_item_current_display_size(idx);
+                if media_type == MangaMediaType::Video {
+                    self.manga_retry_target_side_for_rect(
+                        idx,
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, display_size),
+                    )
+                } else {
+                    self.manga_strip_target_texture_side_from_display_side(
+                        display_size.x.max(display_size.y),
+                    )
+                }
+            }
+            .max(tex_w.max(tex_h));
+            let target_texture_side = self
+                .manga_clamp_target_side_to_source(idx, raw_target_side)
+                .clamp(1, max_side);
+            let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
+            let force_triangle_filters = self.manga_should_force_triangle_filters();
+
+            let requested = self.manga_loader.as_mut().is_some_and(|loader| {
+                loader.retry_visible(&VisibleRetry {
+                    image_list: &self.image_list,
+                    index: idx,
+                    max_texture_side: self.max_texture_side,
+                    target_texture_side,
+                    downscale_filter,
+                    gif_filter,
+                    force_triangle_filters,
+                    repair: RetryRepair::None,
+                })
+            });
+            if requested {
+                self.perf_metrics.count(Metric::MangaRetryEnqueued, 1);
+                self.manga_record_target_side_sample(target_texture_side);
+                queued_retry = true;
+                in_progress = true;
+                still_pending = true;
+            } else if self.manga_loader.is_some() {
+                still_pending = true;
+            }
+        }
+
+        (queued_retry, still_pending)
+    }
 }

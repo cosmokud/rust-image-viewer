@@ -99,15 +99,16 @@ impl ImageViewer {
     /// Manga/masonry upload policy: static pages and video thumbnails may use mipmaps,
     /// animated frames never do, and active scroll/navigation vetoes the rest across all
     /// vertical-scroll views (Masonry, Gallery, and Long Strip).
-    pub(crate) fn manga_upload_policy(
+    pub(crate) fn manga_upload_policy_with_nav(
         &mut self,
         index: usize,
         media_type: MangaMediaType,
         size: (u32, u32),
+        navigation_active: bool,
     ) -> crate::texture_upload::UploadPolicy {
         let kind = upload_media_kind(media_type);
         let mut inputs = base_upload_policy_inputs(self);
-        inputs.navigation_active = self.manga_navigation_active_for_heavy_work();
+        inputs.navigation_active = navigation_active;
         if kind.uses_display_min_side() {
             // Gather the display size only for kinds whose mipmap decision reads it;
             // touching the masonry layout cache for animated frames is wasted work.
@@ -122,6 +123,75 @@ impl ImageViewer {
             };
         }
         inputs.policy(kind)
+    }
+
+    /// Manga/masonry upload policy for the current navigation state.
+    pub(crate) fn manga_upload_policy(
+        &mut self,
+        index: usize,
+        media_type: MangaMediaType,
+        size: (u32, u32),
+    ) -> crate::texture_upload::UploadPolicy {
+        let navigation_active = self.manga_navigation_active_for_heavy_work();
+        self.manga_upload_policy_with_nav(index, media_type, size, navigation_active)
+    }
+
+    pub(crate) fn manga_decoded_fulfills_deferred_mipmap(
+        &mut self,
+        index: usize,
+        path: &Path,
+        media_type: MangaMediaType,
+        decoded_size: (u32, u32),
+        existing_size: (u32, u32),
+        navigation_active: bool,
+    ) -> bool {
+        if navigation_active
+            || decoded_size.0 < existing_size.0
+            || decoded_size.1 < existing_size.1
+            || !self
+                .manga_texture_cache
+                .is_mipmap_deferred_for_path(index, path)
+        {
+            return false;
+        }
+        let settled_policy =
+            self.manga_upload_policy_with_nav(index, media_type, decoded_size, false);
+        if settled_policy.mipmap_enabled(decoded_size) {
+            true
+        } else {
+            self.manga_texture_cache
+                .clear_mipmap_deferred_for_path(index, path);
+            false
+        }
+    }
+
+    /// Flushes deferred Long Strip dimension invalidations once navigation settles
+    /// or when the viewport approaches the earliest deferred page index.
+    pub(crate) fn manga_flush_deferred_strip_dims_if_needed(&mut self) -> bool {
+        if self.mode().is_solo() || self.mode().is_masonry() {
+            return false;
+        }
+        let Some(min_deferred_idx) = self.manga_strip_deferred_dim_min_idx else {
+            return false;
+        };
+        let nav_active = self.manga_navigation_active_for_heavy_work();
+        let viewport_near_deferred = if nav_active && self.manga_total_height_cache_valid {
+            let viewport_bottom_idx = self
+                .manga_index_at_y(self.manga_scroll_offset.max(0.0) + self.screen_size.y.max(1.0));
+            viewport_bottom_idx.saturating_add(4) >= min_deferred_idx
+        } else {
+            false
+        };
+        if !nav_active || viewport_near_deferred {
+            let anchor = self.manga_capture_scroll_anchor();
+            self.invalidate_manga_layout_cache();
+            if let Some(anchor) = anchor {
+                self.manga_apply_scroll_anchor(anchor);
+                self.manga_update_current_index();
+            }
+            return true;
+        }
+        false
     }
 
     /// Process decoded images from the parallel loader and upload them as GPU textures.
@@ -267,6 +337,7 @@ impl ImageViewer {
             .set_max_entries(self.manga_cache_target_capacity);
         let mut uploaded_textures = 0u64;
         let mut processed_items = 0usize;
+        let mut mipmap_only_upgrades_this_pass = 0usize;
         let upload_loop_start = Instant::now();
         let inline_upload_budget =
             Duration::from_secs_f32(self.manga_inline_upload_budget_ms(navigation_active) / 1000.0);
@@ -275,6 +346,33 @@ impl ImageViewer {
         while processed_items < upload_count {
             if uploaded_textures > 0 && upload_loop_start.elapsed() >= inline_upload_budget {
                 break;
+            }
+            if mipmap_only_upgrades_this_pass >= 1 {
+                let front_is_mipmap_only =
+                    self.manga_decoded_mailbox.front().is_some_and(|front| {
+                        self.image_list
+                            .get(front.index)
+                            .is_some_and(|path| path == &front.path)
+                            && self
+                                .manga_texture_cache
+                                .peek_texture_mipmap_info_for_path(
+                                    front.index,
+                                    front.path.as_path(),
+                                )
+                                .is_some_and(|(existing_w, existing_h, _, mipmap_deferred)| {
+                                    mipmap_deferred
+                                        && !self.manga_texture_upgrade_needed(
+                                            existing_w,
+                                            existing_h,
+                                            front.width,
+                                            front.height,
+                                            front.media_type,
+                                        )
+                                })
+                    });
+                if front_is_mipmap_only {
+                    break;
+                }
             }
             let Some(decoded) = self.manga_decoded_mailbox.pop_front() else {
                 break;
@@ -307,21 +405,34 @@ impl ImageViewer {
                 .record(Metric::MangaDecodeResizeMs, decoded.resize_time);
             self.manga_record_target_side_sample(decoded.requested_side);
 
-            // Keep current texture unless the decoded payload is a meaningful quality upgrade.
+            // Keep current texture unless the decoded payload is a meaningful quality or
+            // deferred-mipmap upgrade.
+            let mut is_mipmap_only_upgrade = false;
             if let Some((_, existing_w, existing_h)) = self
                 .manga_texture_cache
                 .get_texture_info_for_path(decoded.index, decoded.path.as_path())
             {
-                if !self.manga_texture_upgrade_needed(
+                let dim_upgrade = self.manga_texture_upgrade_needed(
                     existing_w,
                     existing_h,
                     decoded.width,
                     decoded.height,
                     decoded.media_type,
-                ) {
+                );
+                let mipmap_upgrade = !dim_upgrade
+                    && self.manga_decoded_fulfills_deferred_mipmap(
+                        decoded.index,
+                        decoded.path.as_path(),
+                        decoded.media_type,
+                        (decoded.width, decoded.height),
+                        (existing_w, existing_h),
+                        navigation_active,
+                    );
+                if !dim_upgrade && !mipmap_upgrade {
                     self.manga_ttv_pending.remove(&decoded.index);
                     continue;
                 }
+                is_mipmap_only_upgrade = mipmap_upgrade;
             }
 
             // Skip if no pixel data (failed to extract frame or empty placeholder).
@@ -353,6 +464,8 @@ impl ImageViewer {
                 // budget re-opens on a schedule instead of ending the tile's chances.
                 if exhausted {
                     self.manga_mark_unloadable_if_image(decoded.index, decoded.media_type);
+                    self.manga_texture_cache
+                        .clear_mipmap_deferred_for_path(decoded.index, decoded.path.as_path());
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
@@ -389,6 +502,8 @@ impl ImageViewer {
                 if exhausted {
                     // Same rule as the empty-payload path: only an image settles into the X card.
                     self.manga_mark_unloadable_if_image(decoded.index, decoded.media_type);
+                    self.manga_texture_cache
+                        .clear_mipmap_deferred_for_path(decoded.index, decoded.path.as_path());
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
                 continue;
@@ -404,15 +519,18 @@ impl ImageViewer {
 
             let upload_texture_started = Instant::now();
             crate::diag::note_stage("upload");
-            let texture = crate::texture_upload::upload(
+            let uploaded = crate::texture_upload::upload(
                 ctx,
                 &format!("manga_{}", decoded.index),
                 None,
                 crate::texture_upload::PixelSource::ColorImage(decoded.color_image),
                 (decoded.width, decoded.height),
                 &policy,
-            )
-            .handle;
+            );
+            let texture = uploaded.handle;
+            let mipmap_deferred = !uploaded.mipmap_enabled
+                && !uploaded.used_placeholder
+                && policy.mipmap_deferred((decoded.width, decoded.height));
             let upload_ms = upload_texture_started.elapsed();
             self.perf_metrics
                 .record(Metric::MangaUploadTextureMs, upload_ms);
@@ -435,15 +553,21 @@ impl ImageViewer {
 
             // Insert into cache with media type (this may evict old entries)
             crate::diag::note_stage("cache_insert");
-            let evicted = self.manga_texture_cache.insert_with_type(
-                decoded.index,
-                decoded.path.clone(),
-                texture,
-                decoded.width,
-                decoded.height,
-                decoded.media_type,
-            );
+            let evicted = self
+                .manga_texture_cache
+                .insert_with_type_with_mipmap_deferred(
+                    decoded.index,
+                    decoded.path.clone(),
+                    texture,
+                    decoded.width,
+                    decoded.height,
+                    decoded.media_type,
+                    mipmap_deferred,
+                );
             uploaded_textures = uploaded_textures.saturating_add(1);
+            if is_mipmap_only_upgrade {
+                mipmap_only_upgrades_this_pass = mipmap_only_upgrades_this_pass.saturating_add(1);
+            }
 
             if let Some(started_at) = self.manga_ttv_pending.remove(&decoded.index) {
                 self.manga_record_ttv_sample(started_at.elapsed());

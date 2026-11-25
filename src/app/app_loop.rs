@@ -708,6 +708,9 @@ impl eframe::App for ImageViewer {
                 )
             })
             .unwrap_or((0, 0, 0, 0));
+        if skip_drawing || !self.mode().is_manga() {
+            self.manga_visible_mipmap_upgrade_pending = false;
+        }
         let masonry_metadata_preload_running = self.mode().is_manga()
             && self.mode().is_masonry()
             && self.masonry_metadata_preload_active;
@@ -722,12 +725,13 @@ impl eframe::App for ImageViewer {
                 || self.manga_demand_outstanding
                 || masonry_metadata_preload_running);
         let manga_upload_catchup_pending =
-            self.mode().is_manga() && (manga_mailbox_pending || manga_pending_decoded > 0);
-        let manga_needs_fast_background_poll = self.mode().is_manga()
-            && (masonry_metadata_preload_running
-                || !self.manga_ttv_pending.is_empty()
-                || manga_pending_dimensions > 0
-                || manga_pending_dimension_probes > 0);
+            self.manga_should_catchup_uploads(manga_mailbox_pending, manga_pending_decoded);
+        let manga_needs_fast_background_poll = self.manga_should_fast_poll_background(
+            masonry_metadata_preload_running,
+            manga_pending_dimensions,
+            manga_pending_dimension_probes,
+        );
+        let pending_layout_flush = self.manga_pending_layout_flush_needed();
         let manga_scroll_active = self.mode().is_manga()
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
@@ -808,7 +812,7 @@ impl eframe::App for ImageViewer {
         self.fps_last_frame_was_active = any_animation_active
             || media_load_pending
             || manga_video_load_pending
-            || self.pending_media_layout
+            || pending_layout_flush
             || manga_upload_catchup_pending
             || manga_needs_fast_background_poll
             || manga_background_work_pending
@@ -858,7 +862,7 @@ impl eframe::App for ImageViewer {
         } else if media_load_pending || manga_video_load_pending {
             repaint_reason = "media-load-pending";
             ctx.request_repaint_after(Duration::from_millis(16));
-        } else if self.pending_media_layout {
+        } else if pending_layout_flush {
             repaint_reason = "pending-layout";
             ctx.request_repaint_after(Duration::from_millis(16));
         } else if manga_upload_catchup_pending {
@@ -1041,5 +1045,57 @@ impl eframe::App for ImageViewer {
 
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         self.background_clear_color()
+    }
+}
+
+impl ImageViewer {
+    /// True when manga mode should drain decoded mailbox/loader items at VSync cadence.
+    pub(crate) fn manga_should_catchup_uploads(
+        &self,
+        mailbox_pending: bool,
+        pending_decoded: usize,
+    ) -> bool {
+        self.manga_should_catchup_uploads_with_playback(
+            self.manga_strip_focused_video_playing(),
+            mailbox_pending,
+            pending_decoded,
+        )
+    }
+
+    /// Video-playback-parameterized catchup predicate used by `app_loop` and tests.
+    pub(crate) fn manga_should_catchup_uploads_with_playback(
+        &self,
+        strip_focused_video_playing: bool,
+        mailbox_pending: bool,
+        pending_decoded: usize,
+    ) -> bool {
+        self.mode().is_manga()
+            && !strip_focused_video_playing
+            && (mailbox_pending || pending_decoded > 0)
+    }
+
+    /// True when manga background probes, TTV tracking, or settled deferred mipmap upgrades need
+    /// monitor-rate polling.
+    pub(crate) fn manga_should_fast_poll_background(
+        &self,
+        masonry_metadata_preload_running: bool,
+        pending_dimensions: usize,
+        pending_dimension_probes: usize,
+    ) -> bool {
+        self.mode().is_manga()
+            && (masonry_metadata_preload_running
+                || !self.manga_ttv_pending.is_empty()
+                || pending_dimensions > 0
+                || pending_dimension_probes > 0
+                || (self.manga_visible_mipmap_upgrade_pending
+                    && !self.manga_strip_focused_video_playing()))
+    }
+
+    /// True when solo layout or deferred Long Strip dimension invalidation still needs a flush pass.
+    pub(crate) fn manga_pending_layout_flush_needed(&self) -> bool {
+        self.pending_media_layout
+            || (self.mode().is_manga()
+                && !self.mode().is_masonry()
+                && self.manga_strip_deferred_dim_min_idx.is_some())
     }
 }
