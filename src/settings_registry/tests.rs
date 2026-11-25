@@ -19,9 +19,9 @@ use std::sync::OnceLock;
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_values, capture, format_value, get, get_num, is_builtin, parse_preset, render_preset,
-        rewrite_preset, sanitize_preset_name, set, setting_index_for_key, RowControl, SettingKind,
-        SettingValue, SettingsTab, SETTINGS,
+        apply_values, capture, format_value, get, get_num, int_setting_value, is_builtin,
+        parse_preset, render_preset, rewrite_preset, sanitize_preset_name, set,
+        setting_index_for_key, RowControl, SettingKind, SettingValue, SettingsTab, SETTINGS,
     };
     use crate::config::Config;
 
@@ -110,7 +110,7 @@ mod tests {
         for setting in SETTINGS {
             let value = get(&config, setting.id);
             match (&setting.kind, &value) {
-                (super::SettingKind::Int { min, max }, SettingValue::Num(value)) => assert!(
+                (super::SettingKind::Int { min, max, .. }, SettingValue::Num(value)) => assert!(
                     (*min as f64..=*max as f64).contains(value),
                     "default out of range for {}",
                     setting.key
@@ -230,10 +230,12 @@ mod tests {
         // Unknown ids are an error, not a panic.
         assert!(set(&mut config, 999, &SettingValue::Num(1.0)).is_err());
 
-        // Every bounded kind clamps both ends; the value read back is the clamped one.
-        for setting in SETTINGS {
+        // Every bounded kind clamps both ends; the value read back is the clamped one. Slider-only
+        // integer rows are excluded: their `max` bounds the slider, not the value (see
+        // `slider_only_integer_bounds_do_not_clamp_the_value`).
+        for setting in SETTINGS.iter().filter(|setting| !setting.slider_only()) {
             let (min, max) = match setting.kind {
-                SettingKind::Int { min, max } => (min as f64, max as f64),
+                SettingKind::Int { min, max, .. } => (min as f64, max as f64),
                 SettingKind::Float { min, max, .. } => (min, max),
                 _ => continue,
             };
@@ -402,7 +404,7 @@ mod tests {
         // Slider bounds come straight from `kind`, including integer kinds.
         for setting in SETTINGS {
             let (min, max, decimals) = match setting.kind {
-                SettingKind::Int { min, max } => (min as f64, max as f64, 0),
+                SettingKind::Int { min, max, .. } => (min as f64, max as f64, 0),
                 SettingKind::Float { min, max, decimals } => (min, max, decimals),
                 _ => continue,
             };
@@ -417,6 +419,68 @@ mod tests {
                 _ => panic!("{} is not a slider", setting.key),
             }
             assert_eq!(setting.decimals(), decimals, "{}", setting.key);
+        }
+    }
+
+    /// A slider-only integer range is the slider's range, not the value's: what a caller writes
+    /// through the registry (the number box, `config.ini`, a preset) is stored as it stands above
+    /// the slider's `max`, and only `hard_min` holds it down.
+    #[test]
+    pub(crate) fn slider_only_integer_bounds_do_not_clamp_the_value() {
+        let mut config = Config::default();
+        let decode = setting_index_for_key("max_decode_megapixels").unwrap();
+        let threshold = setting_index_for_key("large_decode_threshold_megapixels").unwrap();
+        assert!(SETTINGS[decode].slider_only());
+        assert!(SETTINGS[threshold].slider_only());
+
+        // Above the slider, far above the old 1024 MP clamp, and below the slider.
+        for megapixels in [4096.0, 10_000.0, 50_000.0, 2.0] {
+            set(&mut config, decode, &SettingValue::Num(megapixels)).unwrap();
+            assert_eq!(
+                config.max_decode_megapixels, megapixels as u64,
+                "typed {megapixels} MP must be stored as typed"
+            );
+            assert_eq!(get_num(&config, decode), megapixels);
+            set(&mut config, threshold, &SettingValue::Num(megapixels)).unwrap();
+            assert_eq!(config.large_decode_threshold_megapixels, megapixels as u32);
+        }
+
+        // The slider still stops at `max`, and a value no backend can hold is clamped, not wrapped.
+        assert_eq!(
+            int_setting_value(SETTINGS[decode].kind, 100_000.0),
+            100_000.0
+        );
+        assert_eq!(
+            int_setting_value(SETTINGS[threshold].kind, 9_999.0),
+            9_999.0
+        );
+        assert_eq!(int_setting_value(SETTINGS[decode].kind, 0.0), 1.0);
+        assert_eq!(int_setting_value(SETTINGS[decode].kind, -5.0), 1.0);
+        set(&mut config, decode, &SettingValue::Num(1e30)).unwrap();
+        assert_eq!(config.max_decode_megapixels, u64::MAX);
+        set(&mut config, threshold, &SettingValue::Num(1e30)).unwrap();
+        assert_eq!(config.large_decode_threshold_megapixels, u32::MAX);
+
+        // Every other integer row keeps both bounds, so the setting file still cannot push a
+        // slider value out of the range its reader was written for.
+        for setting in SETTINGS.iter().filter(|setting| !setting.slider_only()) {
+            let (min, max) = match setting.kind {
+                SettingKind::Int { min, max, .. } => (min as f64, max as f64),
+                _ => continue,
+            };
+            let mut config = Config::default();
+            set(&mut config, setting.id, &SettingValue::Num(max + 1.0)).unwrap();
+            assert!(
+                (get_num(&config, setting.id) - max).abs() < 1e-6,
+                "{}",
+                setting.key
+            );
+            set(&mut config, setting.id, &SettingValue::Num(min - 1.0)).unwrap();
+            assert!(
+                (get_num(&config, setting.id) - min).abs() < 1e-6,
+                "{}",
+                setting.key
+            );
         }
     }
 

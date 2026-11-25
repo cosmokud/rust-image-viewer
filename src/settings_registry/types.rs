@@ -40,9 +40,23 @@ pub enum Applies {
 #[derive(Clone, Copy, Debug)]
 pub enum SettingKind {
     Bool,
-    Int { min: u64, max: u64 },
-    Float { min: f64, max: f64, decimals: usize },
-    Enum { values: &'static [&'static str] },
+    /// Slider bounds, plus the range a typed or hand-edited value is clamped into. A bound that
+    /// exists only to make the slider usable (`slider_only`) clamps the slider and nothing else,
+    /// so a number typed into the box or written into `config.ini` is honoured as it stands.
+    Int {
+        min: u64,
+        max: u64,
+        slider_only: bool,
+        hard_min: u64,
+    },
+    Float {
+        min: f64,
+        max: f64,
+        decimals: usize,
+    },
+    Enum {
+        values: &'static [&'static str],
+    },
     Rgb,
     Key,
     Modifier,
@@ -102,7 +116,7 @@ impl Setting {
     pub fn control(&self) -> RowControl {
         match self.kind {
             SettingKind::Bool => RowControl::Toggle,
-            SettingKind::Int { min, max } => RowControl::Slider {
+            SettingKind::Int { min, max, .. } => RowControl::Slider {
                 min: min as f64,
                 max: max as f64,
                 decimals: 0,
@@ -123,6 +137,19 @@ impl Setting {
             SettingKind::Float { decimals, .. } => decimals,
             _ => 0,
         }
+    }
+
+    /// Whether the integer range is a slider convenience instead of a bound on the value. The
+    /// number box and `config.ini` take anything such a setting accepts; only the slider stops at
+    /// `max`.
+    pub fn slider_only(&self) -> bool {
+        matches!(
+            self.kind,
+            SettingKind::Int {
+                slider_only: true,
+                ..
+            }
+        )
     }
 
     /// Empty for live keys; the modal appends this to the row tooltip.

@@ -11,8 +11,7 @@ use super::{
     needs_large_decode_permit, set_available_memory_for_tests,
     set_large_decode_threshold_megapixels, set_max_decoded_pixels, set_memory_guard_enabled,
     static_zune_decoder_options, LargeDecodeGate, LoadedImage, ABSOLUTE_MAX_DECODED_PIXELS,
-    DEFAULT_LARGE_DECODE_THRESHOLD_MP, DEFAULT_MAX_DECODED_PIXELS, MAX_LARGE_DECODE_THRESHOLD_MP,
-    MEGAPIXEL,
+    DEFAULT_LARGE_DECODE_THRESHOLD_MP, DEFAULT_MAX_DECODED_PIXELS, MEGAPIXEL,
 };
 use image::imageops::FilterType;
 use std::fs;
@@ -40,9 +39,18 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
     path
 }
 
+/// Tests that publish the process-wide decode limits (ceiling, large-decode threshold, RAM guard)
+/// take this lock first. The limits are atomics shared by the whole test binary, so a sibling test
+/// running in parallel would otherwise decide whether a file is allowed or refused.
+pub(crate) fn decode_limit_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[test]
 pub(crate) fn decode_budget_rejects_bomb_dimensions_before_allocating() {
     // Tests share the process-wide ceiling, so each one starts from the shipped default.
+    let _limits = decode_limit_guard();
     set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
 
     // 20000x20000 = 400 MP = 1.5 GiB RGBA: the exact shape the diag log crashed on.
@@ -72,6 +80,7 @@ pub(crate) fn decode_budget_rejects_bomb_dimensions_before_allocating() {
 pub(crate) fn decode_budget_follows_the_configured_megapixel_ceiling() {
     // The ceiling is process-wide, so this test restores it instead of reading it: whatever a
     // sibling test left behind must not decide what this one asserts.
+    let _limits = decode_limit_guard();
     set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
 
     set_max_decoded_pixels(64 * MEGAPIXEL);
@@ -96,10 +105,32 @@ pub(crate) fn decode_budget_follows_the_configured_megapixel_ceiling() {
         "200 MP is the boundary, not a suggestion"
     );
 
-    // Out-of-range values are clamped to the absolute ceiling instead of trusted.
+    // A deliberately typed value is honoured too: the ceiling is whatever the setting says, so a
+    // 10000 MP limit allows a 10000 MP header (the fixed 4 GiB allocation cap is gone as well).
+    set_max_decoded_pixels(10_000 * MEGAPIXEL);
+    let sized = decode_budget_error(100_000, 100_000);
+    assert!(
+        sized
+            .as_deref()
+            .map_or(true, |err| !err.contains("too large")),
+        "10000 MP is allowed: {sized:?}"
+    );
+    assert!(
+        decode_budget_error(100_001, 100_000)
+            .unwrap_or_default()
+            .contains("too large"),
+        "above the typed ceiling is not"
+    );
+    assert!(
+        decode_alloc_budget(100_000, 100_000) > 4 * 1024 * 1024 * 1024,
+        "the allocation ceiling must follow the setting, not a constant"
+    );
+
+    // Only the absolute backstop clamps, and it sits far above the slider range.
     assert_eq!(clamp_decoded_pixels(u64::MAX), ABSOLUTE_MAX_DECODED_PIXELS);
     assert_eq!(clamp_decoded_pixels(0), 1);
     assert_eq!(clamp_decoded_pixels(256 * MEGAPIXEL), 256 * MEGAPIXEL);
+    assert!(ABSOLUTE_MAX_DECODED_PIXELS >= 10_000 * MEGAPIXEL);
 
     set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
     assert_eq!(max_decoded_pixels(), DEFAULT_MAX_DECODED_PIXELS);
@@ -113,6 +144,7 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
 
     // Every assertion about the threshold runs against the shipped default, not whatever a
     // sibling test left in the process-wide atomic.
+    let _limits = decode_limit_guard();
     set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
     assert_eq!(large_decode_threshold_pixels(), 64 * MEGAPIXEL);
 
@@ -126,7 +158,7 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
     );
     assert!(needs_large_decode_permit(10_835, 16_097), "174 MP is gated");
 
-    // The threshold is the setting's value, clamped where it is published.
+    // The threshold is the setting's value, published as it is: the floor is the only clamp.
     set_large_decode_threshold_megapixels(128);
     assert!(
         needs_large_decode_permit(10_835, 16_097),
@@ -137,11 +169,12 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
         "67 MP is under a 128 MP threshold"
     );
     set_large_decode_threshold_megapixels(0);
-    assert_eq!(large_decode_threshold_pixels(), 8 * MEGAPIXEL);
+    assert_eq!(large_decode_threshold_pixels(), MEGAPIXEL);
+    // The ceiling belongs to the slider: a deliberately raised threshold is published as it is.
     set_large_decode_threshold_megapixels(u32::MAX);
     assert_eq!(
         large_decode_threshold_pixels(),
-        u64::from(MAX_LARGE_DECODE_THRESHOLD_MP) * MEGAPIXEL
+        u64::from(u32::MAX) * MEGAPIXEL
     );
     set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
 
@@ -184,6 +217,7 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
 /// message naming the setting, and a machine that cannot report memory never fails a load.
 #[test]
 pub(crate) fn memory_guard_refuses_decodes_that_cannot_fit() {
+    let _limits = decode_limit_guard();
     set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
     set_memory_guard_enabled(true);
     set_available_memory_for_tests(Some(2 * 1024 * 1024 * 1024)); // 2 GiB free
@@ -245,6 +279,11 @@ pub(crate) fn png_claiming_dimensions(width: u32, height: u32) -> (PathBuf, Path
 
 #[test]
 pub(crate) fn bomb_declared_png_is_rejected_without_decoding() {
+    // The bomb shape sits above the configured ceiling, so removing the fixed 4 GiB allocation cap
+    // cannot make it decode: the header check is what refuses it.
+    let _limits = decode_limit_guard();
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
+
     let (root, bomb) = png_claiming_dimensions(20_000, 20_000);
 
     let result = LoadedImage::load_with_max_texture_side(
@@ -256,6 +295,7 @@ pub(crate) fn bomb_declared_png_is_rejected_without_decoding() {
     let err = result.err().expect("bomb must not decode");
     assert!(err.contains("too large"), "unexpected error: {err}");
 
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
     let _ = fs::remove_dir_all(&root);
 }
 
@@ -433,6 +473,7 @@ pub(crate) fn gif_with_no_readable_frame_is_an_error() {
 
 #[test]
 pub(crate) fn constants_stay_consistent() {
+    let _limits = decode_limit_guard();
     assert_eq!(DEFAULT_MAX_DECODED_PIXELS, 256 * MEGAPIXEL);
     assert!(ABSOLUTE_MAX_DECODED_PIXELS > DEFAULT_MAX_DECODED_PIXELS);
     set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);

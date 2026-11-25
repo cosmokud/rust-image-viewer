@@ -265,8 +265,8 @@ pub(crate) fn set_num_field(config: &mut Config, id: usize, value: f64) {
         45 => config.masonry_metadata_ram_cache_limit_mb = value as u64,
         48 => config.masonry_items_per_row = value as usize,
         61 => config.show_fps_update_interval_ms = value as u64,
-        66 => config.max_decode_megapixels = value as u64,
-        67 => config.large_decode_threshold_megapixels = value as u32,
+        66 => config.max_decode_megapixels = value.max(1.0) as u64,
+        67 => config.large_decode_threshold_megapixels = value.max(1.0) as u32,
         68 => config.parallel_large_decodes = value as u8,
         77 => config.manga_mipmap_min_side = value as u32,
         _ => {}

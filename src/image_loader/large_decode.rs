@@ -51,21 +51,20 @@ use zune_image::image::Image as ZuneImage;
 /// every image that loaded before it became configurable still loads exactly as fast.
 pub(crate) const DEFAULT_LARGE_DECODE_THRESHOLD_MP: u32 = 64;
 
-/// Registry range of `large_decode_threshold_megapixels`.
-pub(crate) const MIN_LARGE_DECODE_THRESHOLD_MP: u32 = 8;
-
-pub(crate) const MAX_LARGE_DECODE_THRESHOLD_MP: u32 = 256;
+/// Lowest threshold that is actually published: zero would gate every single file. The upper end
+/// has no clamp here, because the 8-256 range in the registry table bounds the slider only and a
+/// typed or hand-edited value is meant to be honoured.
+pub(crate) fn hard_large_decode_threshold(megapixels: u32) -> u32 {
+    megapixels.max(1)
+}
 
 /// The live `large_decode_threshold_megapixels` value, in decimal megapixels.
 static LARGE_DECODE_THRESHOLD_MP: AtomicU32 = AtomicU32::new(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
 
-/// Publishes the threshold above which a decode is gated. Clamped to the setting's own range so a
-/// corrupt preset cannot gate every file (or none).
+/// Publishes the threshold above which a decode is gated. Only the floor is enforced: the ceiling
+/// belongs to the slider, so a deliberately raised threshold is not clamped back down.
 pub fn set_large_decode_threshold_megapixels(megapixels: u32) {
-    LARGE_DECODE_THRESHOLD_MP.store(
-        megapixels.clamp(MIN_LARGE_DECODE_THRESHOLD_MP, MAX_LARGE_DECODE_THRESHOLD_MP),
-        Ordering::Release,
-    );
+    LARGE_DECODE_THRESHOLD_MP.store(hard_large_decode_threshold(megapixels), Ordering::Release);
 }
 
 pub fn large_decode_threshold_megapixels() -> u32 {

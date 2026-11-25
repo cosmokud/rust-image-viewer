@@ -646,12 +646,14 @@ fallback (`image_decode.rs`). Techniques:
 - `imagesize` header probing before any allocation (`probe.rs`),
 - `memmap2`-backed reader with a buffered fallback (`reader.rs`),
 - decode budget from the header (`budget.rs`): the ceiling is the `max_decode_megapixels`
-  setting (default 256 MP, decimal megapixels, clamped to `ABSOLUTE_MAX_DECODED_PIXELS = 1024 MP`)
-  published into an `AtomicU64` by `set_max_decode_megapixels`, plus
-  `MIN_DECODE_ALLOC_BYTES = 256 MiB` and `DEFAULT_MAX_DECODE_ALLOC_BYTES = 4 GiB` for the
-  header-derived `max_alloc`. The RGBA ceiling is `4 x ceiling + 128 MiB` of decoder scratch. The
-  order of the two checks matters: the ceiling runs first, so a file that is simply too big reports
-  the ceiling rather than a memory problem,
+  setting (default 256 MP, decimal megapixels, published into an `AtomicU64` by
+  `set_max_decode_megapixels`). The 8-1024 range in the registry table bounds the slider only: the
+  number box and `config.ini` accept any larger value and it is honoured, with
+  `ABSOLUTE_MAX_DECODED_PIXELS = 1,000,000 MP` as the single backstop. `MIN_DECODE_ALLOC_BYTES =
+  256 MiB` is the floor of the header-derived `max_alloc`, whose ceiling is the setting itself
+  (`4 x ceiling + 128 MiB` of decoder scratch) rather than a fixed constant. The order of the two
+  checks matters: the ceiling runs first, so a file that is simply too big reports the ceiling
+  rather than a memory problem,
 - `large_decode.rs`: decodes whose header declares more than `large_decode_threshold_megapixels`
   (default 64 MP) take a permit (`parallel_large_decodes`, default 1) that yields to rayon
   (never parks, bounded wait) so a masonry sweep cannot hold several gigabyte-sized frames at

@@ -36,9 +36,8 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
 
-// Keep a generous decode budget so very large static images can load at full quality.
-// Header-based probing and dimension checks still guard against invalid/corrupt inputs.
-pub(crate) const DEFAULT_MAX_DECODE_ALLOC_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+// The per-decode allocation ceiling is derived from the configured megapixel limit instead of a
+// constant: see `decode_alloc_budget`.
 
 /// One "megapixel" in this module's budget, the unit the error text quotes.
 pub(crate) const MEGAPIXEL: u64 = 1_000_000;
@@ -49,9 +48,10 @@ pub(crate) const MEGAPIXEL: u64 = 1_000_000;
 /// camera, phone and image editor reports for the file.
 pub(crate) const DEFAULT_MAX_DECODED_PIXELS: u64 = 256 * MEGAPIXEL;
 
-/// Hard ceiling for the setting itself (`SettingKind::Int { max: 1024 }`), mirrored here so a
-/// hand-edited or corrupt preset cannot ask a decoder to allocate beyond 4 GiB of RGBA.
-pub(crate) const ABSOLUTE_MAX_DECODED_PIXELS: u64 = 1024 * MEGAPIXEL;
+/// Hard ceiling for the setting itself, mirrored here as a backstop. The Settings window and
+/// `config.ini` accept any value up to it, so this is not the slider's 1024 MP range: a typed
+/// `10000` MP really means 10000 MP.
+pub(crate) const ABSOLUTE_MAX_DECODED_PIXELS: u64 = 1_000_000 * MEGAPIXEL;
 
 /// One decoded RGBA buffer plus decoder scratch (inflate window, filter rows). `max_alloc` never
 /// exceeds it and no payload above it leaves this module.
@@ -74,7 +74,7 @@ pub fn set_max_decoded_pixels(pixels: u64) {
 }
 
 /// The accepted range for a published ceiling: at least one pixel, at most the setting's own
-/// maximum. Kept separate from the store so the clamp can be tested without touching the
+/// absolute maximum. Kept separate from the store so the clamp can be tested without touching the
 /// process-wide value every decoding test reads.
 pub(crate) fn clamp_decoded_pixels(pixels: u64) -> u64 {
     pixels.clamp(1, ABSOLUTE_MAX_DECODED_PIXELS)
@@ -123,16 +123,15 @@ pub(crate) fn decode_budget_error(width: u32, height: u32) -> Option<String> {
     memory_budget_error(width, height)
 }
 
-/// Header-derived `max_alloc`, clamped into `[MIN, ceiling]` so neither a tiny nor a lying header
-/// can talk the decoder into an unbounded allocation.
+/// Header-derived `max_alloc`: the frame the header declares plus scratch, with no ceiling of its
+/// own. The configured megapixel limit already bounded those dimensions in `decode_budget_error`,
+/// so a fixed cap here would silently contradict a deliberately raised limit.
 pub(crate) fn decode_alloc_budget(width: u32, height: u32) -> u64 {
     let estimated = (width as u64)
         .saturating_mul(height as u64)
         .saturating_mul(4)
         .saturating_add(DECODE_SCRATCH_ALLOWANCE_BYTES);
-    estimated
-        .clamp(MIN_DECODE_ALLOC_BYTES, DEFAULT_MAX_DECODE_ALLOC_BYTES)
-        .min(max_decoded_rgba_bytes())
+    estimated.clamp(MIN_DECODE_ALLOC_BYTES, max_decoded_rgba_bytes())
 }
 
 pub(crate) fn check_decoded_buffer_len(len: usize) -> Result<(), String> {

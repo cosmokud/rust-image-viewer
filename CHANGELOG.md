@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Changed
+
+- The 8-1024 slider range of `max_decode_megapixels` and the 8-256 range of `large_decode_threshold_megapixels` now bound the slider only: typing a number into the box beside it, or writing the key in `config.ini`, accepts any larger value (a typed `10000` MP really is a 10000 MP limit). Both tooltips say so, and their internal clamps now follow the setting instead of capping it.
+
+### Removed
+
+- The fixed 4 GiB per-decode allocation ceiling. The allocation budget follows the configured megapixel limit, which is the check that decides whether a file may decode at all.
+
 ## [0.4.8] - 2026-11-25
 
 ### Highlights

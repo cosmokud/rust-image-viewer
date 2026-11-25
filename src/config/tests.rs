@@ -49,7 +49,7 @@ pub(crate) fn legacy_alias_spellings_parse_like_their_registry_key() {
         match setting.kind {
             SettingKind::Int { .. } | SettingKind::Float { .. } => {
                 let (min, max) = match setting.kind {
-                    SettingKind::Int { min, max } => (min as f64, max as f64),
+                    SettingKind::Int { min, max, .. } => (min as f64, max as f64),
                     SettingKind::Float { min, max, .. } => (min, max),
                     _ => unreachable!(),
                 };
@@ -221,4 +221,21 @@ pub(crate) fn fullscreen_remember_view_state_in_ram_parses_false() {
     let config = Config::parse_ini("[settings]\nfullscreen_remember_view_state_in_ram = false\n");
 
     assert!(!config.fullscreen_remember_view_state_in_ram);
+}
+
+/// A hand-edited `config.ini` is not limited to the slider range: the megapixel keys take any
+/// value above it (and any value down to their floor).
+#[test]
+pub(crate) fn decode_limits_in_config_ini_are_not_limited_to_the_slider_range() {
+    let config = Config::parse_ini(
+        "[Performance]\nmax_decode_megapixels = 10000\nlarge_decode_threshold_megapixels = 5000\n",
+    );
+    assert_eq!(config.max_decode_megapixels, 10_000);
+    assert_eq!(config.large_decode_threshold_megapixels, 5_000);
+
+    let below = Config::parse_ini(
+        "[Performance]\nmax_decode_megapixels = 0\nlarge_decode_threshold_megapixels = 0\n",
+    );
+    assert_eq!(below.max_decode_megapixels, 1);
+    assert_eq!(below.large_decode_threshold_megapixels, 1);
 }

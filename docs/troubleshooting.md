@@ -17,7 +17,7 @@
 
 ## Images
 
-1. `Image is too large to decode` — the file exceeds `max_decode_megapixels` (default 256 MP). Raise it in Settings -> Performance -> Decode Limits, or in `config.ini`.
+1. `Image is too large to decode` — the file exceeds `max_decode_megapixels` (default 256 MP). Raise it in Settings -> Performance -> Decode Limits, or in `config.ini`. The slider stops at 1024 MP, but the number box beside it (and the key itself in `config.ini`) accepts more, so `10000` is a valid entry.
 2. `Not enough free memory to decode` — the file is above `large_decode_threshold_megapixels` and needs more than half of the currently available RAM. Close something, or raise the threshold so the check stops applying to files that size.
 3. Large images load slowly one at a time — that is `parallel_large_decodes = 1`. Raise it (up to 8) on a machine with plenty of RAM.
 

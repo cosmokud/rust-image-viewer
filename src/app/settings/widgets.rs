@@ -132,7 +132,8 @@ impl ImageViewer {
         response.on_hover_cursor(egui::CursorIcon::PointingHand)
     }
 
-    /// Float/Int row: slider + DragValue, clamped and mirrored through the registry.
+    /// Slider track + number box for a numeric row; the box may exceed the slider range on a
+    /// slider-only setting, so a value above it has to reach the registry as typed.
     pub(crate) fn draw_settings_number_control(
         &mut self,
         ui: &mut egui::Ui,
@@ -145,6 +146,14 @@ impl ImageViewer {
         let id = setting.id;
         let mut value = self.settings.values[id];
         let step = 10f64.powi(-(decimals as i32)) * 5.0;
+        // The number box is not limited to the slider range: typing 10000 into a slider-only
+        // setting (see `SettingKind::Int { slider_only }`) is how a value above the handy range is
+        // set. The registry clamps what the backend cannot hold, so the box can stay open.
+        let typed_max = if setting.slider_only() {
+            f64::INFINITY
+        } else {
+            max
+        };
         let number_box_width = 84.0_f32.min((controls_width * 0.45).max(56.0));
         let drag_response = ui
             .scope(|ui| {
@@ -155,7 +164,7 @@ impl ImageViewer {
                     [number_box_width, SETTINGS_INPUT_HEIGHT],
                     egui::DragValue::new(&mut value)
                         .fixed_decimals(decimals)
-                        .range(min..=max)
+                        .range(min..=typed_max)
                         .speed(step),
                 )
             })

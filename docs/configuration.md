@@ -71,12 +71,14 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `use_hardware_acceleration`   | `true`  | Master switch for hardware-accelerated paths.             |
 | `enable_d3d12`                | `true`  | Prefer D3D12 decoders (falls back to D3D11).              |
 | `enable_cuda`                 | `true`  | Enable CUDA decoder preference where supported.           |
-| `max_decode_megapixels`       | `256`   | Largest still image the decoder opens, in decimal megapixels (`width x height / 1,000,000`); raise it for 150-200 MP panoramas, lower it to cap RAM. |
-| `large_decode_threshold_megapixels` | `64` | Images above this size count as large: they take the limited slots below and are the ones checked against free RAM. |
+| `max_decode_megapixels`       | `256`   | Largest still image the decoder opens, in decimal megapixels (`width x height / 1,000,000`); raise it for 150-200 MP panoramas, lower it to cap RAM. The Settings slider covers 8-1024; typing in the number box or editing this key accepts any larger value (e.g. `10000`) as it stands. |
+| `large_decode_threshold_megapixels` | `64` | Images above this size count as large: they take the limited slots below and are the ones checked against free RAM. Slider 8-256; typed or hand-edited values are honoured as they stand. |
 | `parallel_large_decodes`      | `1`     | How many images above the threshold may decode at once. 1 bounds the peak memory of a gallery sweep; raise it on a big-RAM machine. |
 | `decode_memory_guard`         | `true`  | Refuse a decode that needs more than half of the memory Windows reports as available, instead of thrashing the pagefile. |
 
-The last four form the **Decode Limits** card in Settings -> Performance.
+The last four form the **Decode Limits** card in Settings -> Performance. For the two megapixel
+rows the slider range is a convenience: typing a number into the box next to it, or writing the
+key in `config.ini`, is not limited to that range, and the value is used exactly as written.
 
 ## Quality
 

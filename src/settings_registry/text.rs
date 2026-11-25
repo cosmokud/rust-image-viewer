@@ -75,16 +75,12 @@ pub(crate) fn set_value(
 ) -> Result<(), String> {
     match setting.kind {
         SettingKind::Bool => set_bool(config, setting.id, as_bool(value)?),
-        SettingKind::Int { min, max } => {
+        SettingKind::Int { .. } => {
             let value = as_num(value)?;
             if !value.is_finite() {
                 return Err("value must be finite".to_string());
             }
-            set_num_field(
-                config,
-                setting.id,
-                value.round().clamp(min as f64, max as f64),
-            );
+            set_num_field(config, setting.id, int_setting_value(setting.kind, value));
         }
         SettingKind::Float { min, max, .. } => {
             let value = as_num(value)?;
@@ -96,6 +92,27 @@ pub(crate) fn set_value(
         _ => set_text(config, setting, &as_text(value, setting.decimals())?)?,
     }
     Ok(())
+}
+
+/// The value an integer setting actually stores for a requested `value`. Slider bounds clamp by
+/// default. A `slider_only` kind clamps its slider and nothing else: only `hard_min` holds a
+/// typed or hand-edited value, so `max_decode_megapixels = 10000` in `config.ini` means 10000.
+/// `f64` -> `u64` saturates, so a typed `1e30` lands on `u64::MAX` instead of wrapping to 0.
+pub(crate) fn int_setting_value(kind: SettingKind, value: f64) -> f64 {
+    let rounded = value.round();
+    if let SettingKind::Int {
+        min,
+        max,
+        slider_only,
+        hard_min,
+    } = kind
+    {
+        if slider_only {
+            return rounded.max(hard_min as f64);
+        }
+        return rounded.clamp(min as f64, max as f64);
+    }
+    rounded
 }
 
 /// Keeps the autoscroll min/max pairs ordered: the key the caller just wrote wins.
