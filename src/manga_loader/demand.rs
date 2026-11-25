@@ -60,7 +60,10 @@ impl MangaLoader {
         let cache_start = demand.anchor_index.saturating_sub(behind);
         let cache_end = (demand.anchor_index + ahead).min(image_list.len());
         self.queue_dimension_range(image_list, cache_start, cache_end);
-        self.rearm_failed_in_window(image_list, cache_start, cache_end);
+        // Defer synchronous FileStamp::of_path probes while actively scrolling/navigating.
+        if !demand.navigation_active {
+            self.rearm_failed_in_window(image_list, cache_start, cache_end);
+        }
 
         self.prefetch(
             image_list,

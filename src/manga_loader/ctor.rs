@@ -227,6 +227,7 @@ impl MangaTextureCache {
             unpinned_entries: LruCache::new(capacity),
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
+            last_pinned_sorted: Vec::new(),
         }
     }
 }

@@ -43,6 +43,8 @@ pub struct MangaTextureCache {
     pub(crate) max_entries: usize,
     /// Indices that should not be evicted while still visible.
     pub(crate) pinned_indices: HashSet<usize>,
+    /// Last sorted pinned slice, used to skip redundant set_pinned_indices churn.
+    pub(crate) last_pinned_sorted: Vec<usize>,
 }
 
 #[derive(Clone)]
@@ -68,7 +70,9 @@ impl MangaTextureCache {
                 break;
             };
 
-            self.pinned_indices.remove(&idx);
+            if self.pinned_indices.remove(&idx) {
+                self.last_pinned_sorted.clear();
+            }
             evicted.push(idx);
         }
 
@@ -110,6 +114,19 @@ impl MangaTextureCache {
         }
 
         self.pinned_indices = new_pinned;
+        self.last_pinned_sorted.clear();
+        self.last_pinned_sorted
+            .extend(self.pinned_indices.iter().copied());
+        self.last_pinned_sorted.sort_unstable();
+    }
+
+    /// Fast slice variant for sorted, deduplicated visible indices: returns immediately
+    /// without allocations when the pinned set is unchanged from the previous frame.
+    pub fn set_pinned_indices_slice(&mut self, pinned: &[usize]) {
+        if pinned == self.last_pinned_sorted.as_slice() {
+            return;
+        }
+        self.set_pinned_indices(pinned.iter().copied());
     }
 
     /// Increment frame counter (call once per frame).
@@ -255,7 +272,9 @@ impl MangaTextureCache {
     pub fn remove(&mut self, index: usize) {
         self.pinned_entries.remove(&index);
         self.unpinned_entries.pop(&index);
-        self.pinned_indices.remove(&index);
+        if self.pinned_indices.remove(&index) {
+            self.last_pinned_sorted.clear();
+        }
     }
 
     /// Check if cache is empty.
@@ -263,11 +282,11 @@ impl MangaTextureCache {
         self.total_entries() == 0
     }
 
-    /// Get indices of all cached textures.
-    pub fn cached_indices(&self) -> Vec<usize> {
-        let mut indices = Vec::with_capacity(self.total_entries());
-        indices.extend(self.pinned_entries.keys().copied());
-        indices.extend(self.unpinned_entries.iter().map(|(idx, _)| *idx));
-        indices
+    /// Get indices of all cached textures into a caller-owned scratch buffer.
+    pub fn cached_indices_into(&self, out: &mut Vec<usize>) {
+        out.clear();
+        out.reserve(self.total_entries());
+        out.extend(self.pinned_entries.keys().copied());
+        out.extend(self.unpinned_entries.iter().map(|(idx, _)| *idx));
     }
 }

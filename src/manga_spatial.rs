@@ -54,8 +54,22 @@ impl MangaSpatialIndex {
     }
 
     pub fn query_indices(&self, min_x: f32, min_y: f32, max_x: f32, max_y: f32) -> Vec<usize> {
+        let mut indices = Vec::new();
+        self.query_indices_into(min_x, min_y, max_x, max_y, &mut indices);
+        indices
+    }
+
+    pub fn query_indices_into(
+        &self,
+        min_x: f32,
+        min_y: f32,
+        max_x: f32,
+        max_y: f32,
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
         if self.is_empty() {
-            return Vec::new();
+            return;
         }
 
         let query_min_x = min_x.min(max_x);
@@ -65,35 +79,35 @@ impl MangaSpatialIndex {
 
         let envelope = AABB::from_corners([query_min_x, query_min_y], [query_max_x, query_max_y]);
 
-        let mut indices: Vec<usize> = self
-            .tree
-            .locate_in_envelope_intersecting(&envelope)
-            .filter_map(|entry| {
-                // Keep strict overlap semantics to match the linear viewport checks used in
-                // the pre-existing rendering and preload code paths.
-                let overlaps_x = entry.min[0] < query_max_x && entry.max[0] > query_min_x;
-                let overlaps_y = entry.min[1] < query_max_y && entry.max[1] > query_min_y;
+        for entry in self.tree.locate_in_envelope_intersecting(&envelope) {
+            // Keep strict overlap semantics to match the linear viewport checks used in
+            // the pre-existing rendering and preload code paths.
+            let overlaps_x = entry.min[0] < query_max_x && entry.max[0] > query_min_x;
+            let overlaps_y = entry.min[1] < query_max_y && entry.max[1] > query_min_y;
 
-                if overlaps_x && overlaps_y {
-                    Some(entry.index)
-                } else {
-                    None
-                }
-            })
-            .collect();
+            if overlaps_x && overlaps_y {
+                out.push(entry.index);
+            }
+        }
 
         // Keep output deterministic so preload/draw behavior remains stable.
-        indices.sort_unstable();
-        indices.dedup();
-        indices
+        out.sort_unstable();
+        out.dedup();
     }
 
     pub fn query_vertical_band(&self, min_y: f32, max_y: f32) -> Vec<usize> {
-        self.query_indices(
+        let mut indices = Vec::new();
+        self.query_vertical_band_into(min_y, max_y, &mut indices);
+        indices
+    }
+
+    pub fn query_vertical_band_into(&self, min_y: f32, max_y: f32, out: &mut Vec<usize>) {
+        self.query_indices_into(
             -STRIP_QUERY_HALF_WIDTH,
             min_y,
             STRIP_QUERY_HALF_WIDTH,
             max_y,
-        )
+            out,
+        );
     }
 }

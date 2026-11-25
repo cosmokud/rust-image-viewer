@@ -236,11 +236,13 @@ pub struct UploadPolicy {
     pub frame_budget_tight: bool,
 }
 
-/// Pixels for an upload. `OpaqueBytes` is the zero-copy video path.
+/// Pixels for an upload. `OpaqueBytes` is the zero-copy video path; `ColorImage` is pre-converted off-thread.
 pub enum PixelSource<'a> {
     Rgba(&'a [u8]),
     /// Zero-copy video path; falls back to a plain conversion when the layout is rejected.
     OpaqueBytes(&'a Bytes),
+    /// Pre-converted and premultiplied `egui::ColorImage` built off the UI thread.
+    ColorImage(egui::ColorImage),
 }
 
 pub struct UploadResult {
@@ -319,6 +321,55 @@ fn color_image(pixels: PixelSource<'_>, size: (u32, u32)) -> egui::ColorImage {
                 Err(rgba) => egui::ColorImage::from_rgba_unmultiplied(size, &rgba),
             }
         }
+        PixelSource::ColorImage(image) => image,
+    }
+}
+
+fn try_reinterpret_opaque_rgba_vec(
+    size: [usize; 2],
+    pixels_vec: Vec<u8>,
+) -> Result<egui::ColorImage, Vec<u8>> {
+    let expected_len = size[0].saturating_mul(size[1]).saturating_mul(4);
+    if expected_len != pixels_vec.len() {
+        return Err(pixels_vec);
+    }
+    if !pixels_vec
+        .capacity()
+        .is_multiple_of(std::mem::size_of::<egui::Color32>())
+    {
+        return Err(pixels_vec);
+    }
+
+    // Video frames negotiated as RGBA (and opaque decoded images) have alpha == 255.
+    // Color32 has the same byte layout for opaque sRGBA, so this avoids egui's per-pixel copy/premultiply loop.
+    debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
+    debug_assert_eq!(std::mem::align_of::<egui::Color32>(), 1);
+    let mut pixels_vec = std::mem::ManuallyDrop::new(pixels_vec);
+    let color_len = pixels_vec.len() / 4;
+    let color_cap = pixels_vec.capacity() / 4;
+    let color_ptr = pixels_vec.as_mut_ptr() as *mut egui::Color32;
+    let pixels = unsafe { Vec::from_raw_parts(color_ptr, color_len, color_cap) };
+
+    Ok(egui::ColorImage { size, pixels })
+}
+
+/// Converts an owned unmultiplied RGBA buffer into a premultiplied `egui::ColorImage`
+/// off the UI thread, using a zero-copy reinterpret fast path when every pixel is opaque.
+pub fn rgba_vec_to_color_image(size: (u32, u32), pixels: Vec<u8>) -> egui::ColorImage {
+    let size = [size.0 as usize, size.1 as usize];
+    let expected_len = size[0].saturating_mul(size[1]).saturating_mul(4);
+    if expected_len == 0 || pixels.len() != expected_len {
+        return egui::ColorImage::default();
+    }
+
+    let all_opaque = pixels.as_chunks::<4>().0.iter().all(|px| px[3] == 255);
+    if all_opaque {
+        match try_reinterpret_opaque_rgba_vec(size, pixels) {
+            Ok(image) => image,
+            Err(pixels) => egui::ColorImage::from_rgba_unmultiplied(size, &pixels),
+        }
+    } else {
+        egui::ColorImage::from_rgba_unmultiplied(size, &pixels)
     }
 }
 
@@ -331,26 +382,9 @@ fn try_color_image_from_opaque_rgba_bytes(
         return Err(pixels);
     }
 
-    let pixels_mut = match pixels.try_into_mut() {
-        Ok(pixels_mut) => pixels_mut,
-        Err(pixels) => return Err(pixels),
-    };
+    let pixels_mut = pixels.try_into_mut()?;
     let pixels_vec: Vec<u8> = pixels_mut.into();
-    if pixels_vec.capacity() % std::mem::size_of::<egui::Color32>() != 0 {
-        return Err(Bytes::from(pixels_vec));
-    }
-
-    // Video frames negotiated as RGBA are opaque. Color32 has the same byte layout
-    // for opaque sRGBA, so this avoids egui's per-pixel conversion loop.
-    debug_assert_eq!(std::mem::size_of::<egui::Color32>(), 4);
-    debug_assert_eq!(std::mem::align_of::<egui::Color32>(), 1);
-    let mut pixels_vec = std::mem::ManuallyDrop::new(pixels_vec);
-    let color_len = pixels_vec.len() / 4;
-    let color_cap = pixels_vec.capacity() / 4;
-    let color_ptr = pixels_vec.as_mut_ptr() as *mut egui::Color32;
-    let pixels = unsafe { Vec::from_raw_parts(color_ptr, color_len, color_cap) };
-
-    Ok(egui::ColorImage { size, pixels })
+    try_reinterpret_opaque_rgba_vec(size, pixels_vec).map_err(Bytes::from)
 }
 
 #[cfg(test)]
@@ -572,5 +606,41 @@ mod tests {
             oversized_payload_reason((4096, 4096), 4096 * 4096 * 4, 8192),
             None
         );
+    }
+
+    #[test]
+    fn rgba_vec_to_color_image_opaque_fast_path_matches_egui() {
+        let rgba: Vec<u8> = (0..16)
+            .flat_map(|i| [(i * 15) as u8, (255 - i * 11) as u8, (i * 7) as u8, 255])
+            .collect();
+        let expected = egui::ColorImage::from_rgba_unmultiplied([4, 4], &rgba);
+        let actual = rgba_vec_to_color_image((4, 4), rgba);
+
+        assert_eq!(actual.size, [4, 4]);
+        assert_eq!(actual.pixels, expected.pixels);
+    }
+
+    #[test]
+    fn rgba_vec_to_color_image_alpha_premultiplies_matching_egui() {
+        let rgba = vec![
+            200, 100, 50, 0, // fully transparent
+            200, 100, 50, 128, // half transparent
+            200, 100, 50, 200, // semi-transparent
+            200, 100, 50, 255, // opaque
+        ];
+        let expected = egui::ColorImage::from_rgba_unmultiplied([2, 2], &rgba);
+        let actual = rgba_vec_to_color_image((2, 2), rgba);
+
+        assert_eq!(actual.size, [2, 2]);
+        assert_eq!(actual.pixels, expected.pixels);
+    }
+
+    #[test]
+    fn rgba_vec_to_color_image_empty_or_mismatched_returns_default() {
+        let empty = rgba_vec_to_color_image((0, 0), Vec::new());
+        assert!(empty.pixels.is_empty());
+
+        let mismatched = rgba_vec_to_color_image((2, 2), vec![255; 8]);
+        assert!(mismatched.pixels.is_empty());
     }
 }
