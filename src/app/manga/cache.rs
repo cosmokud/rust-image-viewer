@@ -41,47 +41,74 @@ impl ImageViewer {
             let viewport_center_x = viewport_left + self.screen_size.x * 0.5;
             let viewport_center_y = viewport_top + viewport_h * 0.5;
 
-            let candidate_indices: Vec<usize> = if self.manga_use_rtree_backend() {
+            let mut best_idx = self.current_index.min(len.saturating_sub(1));
+            let mut best_score = f32::MAX;
+
+            if self.manga_use_rtree_backend() {
                 let layout_left = viewport_left / zoom;
                 let layout_right = viewport_right / zoom;
                 let layout_top = viewport_top / zoom;
                 let layout_bottom = viewport_bottom / zoom;
-                self.manga_ensure_masonry_spatial_index()
-                    .map(|index| {
-                        index.query_indices(layout_left, layout_top, layout_right, layout_bottom)
-                    })
-                    .unwrap_or_default()
+                let mut candidates = std::mem::take(&mut self.manga_visible_indices_scratch);
+                candidates.clear();
+                if let Some(index) = self.manga_ensure_masonry_spatial_index() {
+                    index.query_indices_into(
+                        layout_left,
+                        layout_top,
+                        layout_right,
+                        layout_bottom,
+                        &mut candidates,
+                    );
+                }
+                for &idx in &candidates {
+                    let Some(item) = self.masonry_layout_items.get(idx) else {
+                        continue;
+                    };
+
+                    let item_top = item.y * zoom;
+                    let item_bottom = item_top + item.height * zoom;
+                    let item_left = item.x * zoom;
+                    let item_right = item_left + item.width * zoom;
+                    if item_top >= viewport_bottom || item_bottom <= viewport_top {
+                        continue;
+                    }
+                    if item_left >= viewport_right || item_right <= viewport_left {
+                        continue;
+                    }
+
+                    let cx = item_left + item.width * zoom * 0.5;
+                    let cy = item_top + item.height * zoom * 0.5;
+                    let dx = cx - viewport_center_x;
+                    let dy = cy - viewport_center_y;
+                    let score = dx * dx * 0.25 + dy * dy;
+                    if score < best_score {
+                        best_score = score;
+                        best_idx = idx;
+                    }
+                }
+                self.manga_visible_indices_scratch = candidates;
             } else {
-                (0..self.masonry_layout_items.len()).collect()
-            };
+                for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+                    let item_top = item.y * zoom;
+                    let item_bottom = item_top + item.height * zoom;
+                    let item_left = item.x * zoom;
+                    let item_right = item_left + item.width * zoom;
+                    if item_top >= viewport_bottom || item_bottom <= viewport_top {
+                        continue;
+                    }
+                    if item_left >= viewport_right || item_right <= viewport_left {
+                        continue;
+                    }
 
-            let mut best_idx = self.current_index.min(len.saturating_sub(1));
-            let mut best_score = f32::MAX;
-
-            for idx in candidate_indices {
-                let Some(item) = self.masonry_layout_items.get(idx) else {
-                    continue;
-                };
-
-                let item_top = item.y * zoom;
-                let item_bottom = item_top + item.height * zoom;
-                let item_left = item.x * zoom;
-                let item_right = item_left + item.width * zoom;
-                if item_top >= viewport_bottom || item_bottom <= viewport_top {
-                    continue;
-                }
-                if item_left >= viewport_right || item_right <= viewport_left {
-                    continue;
-                }
-
-                let cx = item_left + item.width * zoom * 0.5;
-                let cy = item_top + item.height * zoom * 0.5;
-                let dx = cx - viewport_center_x;
-                let dy = cy - viewport_center_y;
-                let score = dx * dx * 0.25 + dy * dy;
-                if score < best_score {
-                    best_score = score;
-                    best_idx = idx;
+                    let cx = item_left + item.width * zoom * 0.5;
+                    let cy = item_top + item.height * zoom * 0.5;
+                    let dx = cx - viewport_center_x;
+                    let dy = cy - viewport_center_y;
+                    let score = dx * dx * 0.25 + dy * dy;
+                    if score < best_score {
+                        best_score = score;
+                        best_idx = idx;
+                    }
                 }
             }
 
@@ -107,12 +134,15 @@ impl ImageViewer {
         let viewport_bottom = viewport_top + viewport_h;
         let viewport_center = viewport_top + viewport_h * 0.5;
 
-        let mut candidate_indices = if self.manga_use_rtree_backend() {
-            self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let mut candidate_indices = std::mem::take(&mut self.manga_visible_indices_scratch);
+        candidate_indices.clear();
+        if self.manga_use_rtree_backend() {
+            self.manga_query_visible_indices_rtree_into(
+                viewport_top,
+                viewport_bottom,
+                &mut candidate_indices,
+            );
+        }
 
         if candidate_indices.is_empty() {
             // Only consider items intersecting the viewport.
@@ -126,6 +156,7 @@ impl ImageViewer {
 
         self.manga_ensure_layout_cache();
         if self.manga_layout_offsets.len() != len + 1 {
+            self.manga_visible_indices_scratch = candidate_indices;
             return self.current_index.min(len.saturating_sub(1));
         }
 
@@ -133,7 +164,7 @@ impl ImageViewer {
         let mut best_center_distance = f32::MAX;
 
         // Use prefix sums directly for speed.
-        for idx in candidate_indices {
+        for &idx in &candidate_indices {
             if idx >= len || idx + 1 >= self.manga_layout_offsets.len() {
                 continue;
             }
@@ -146,6 +177,7 @@ impl ImageViewer {
                 best_idx = idx;
             }
         }
+        self.manga_visible_indices_scratch = candidate_indices;
 
         best_idx
     }

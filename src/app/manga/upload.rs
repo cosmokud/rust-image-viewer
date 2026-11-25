@@ -97,7 +97,8 @@ impl ImageViewer {
     }
 
     /// Manga/masonry upload policy: static pages and video thumbnails may use mipmaps,
-    /// animated frames never do, and masonry navigation vetoes the rest.
+    /// animated frames never do, and active scroll/navigation vetoes the rest across all
+    /// vertical-scroll views (Masonry, Gallery, and Long Strip).
     pub(crate) fn manga_upload_policy(
         &mut self,
         index: usize,
@@ -106,8 +107,7 @@ impl ImageViewer {
     ) -> crate::texture_upload::UploadPolicy {
         let kind = upload_media_kind(media_type);
         let mut inputs = base_upload_policy_inputs(self);
-        inputs.navigation_active =
-            self.mode().is_masonry() && self.masonry_navigation_active_for_heavy_work();
+        inputs.navigation_active = self.manga_navigation_active_for_heavy_work();
         if kind.uses_display_min_side() {
             // Gather the display size only for kinds whose mipmap decision reads it;
             // touching the masonry layout cache for animated frames is wasted work.
@@ -133,6 +133,7 @@ impl ImageViewer {
 
         let upload_pass_started = Instant::now();
 
+        let navigation_active = self.manga_navigation_active_for_heavy_work();
         let defer_masonry_layout_work = self.masonry_navigation_active_for_heavy_work();
 
         let (pending_loads, pending_decoded, pending_dims) = self
@@ -163,16 +164,15 @@ impl ImageViewer {
             // Limiting messages per frame prevents layout updates from causing bursts of work.
             // A backed-up dimension channel drains wider even while navigating: the dim worker
             // parks refused chunks, and dims that never arrive leave tiles on 16:9 and re-probing.
-            let dim_poll_limit =
-                if defer_masonry_layout_work || self.masonry_metadata_preload_active {
-                    if pending_dims >= 2 {
-                        4
-                    } else {
-                        1
-                    }
-                } else {
+            let dim_poll_limit = if navigation_active || self.masonry_metadata_preload_active {
+                if pending_dims >= 2 {
                     4
-                };
+                } else {
+                    1
+                }
+            } else {
+                4
+            };
             let taken = loader.take(max_decoded, dim_poll_limit);
 
             (taken.decoded, taken.dimension_updates)
@@ -188,8 +188,11 @@ impl ImageViewer {
         }
 
         let layout_dims_changed = !layout_dim_updates.is_empty();
+        let mut dims_updated = false;
 
         // Dimension updates can change page heights; invalidate cached layout/prefix sums.
+        // During active Long Strip scroll, only rebuild immediately if an item at/above/inside
+        // the viewport changed; far-below updates are deferred until scroll settles or nears them.
         if layout_dims_changed {
             crate::diag::note_stage("dim_flush");
             if self.mode().is_masonry() {
@@ -198,10 +201,24 @@ impl ImageViewer {
                     let force_flush = !self.masonry_metadata_preload_active;
                     self.masonry_flush_pending_dimension_updates(force_flush);
                 }
-            } else if defer_masonry_layout_work {
-                self.masonry_layout_invalidation_deferred = true;
+                dims_updated = true;
+            } else if navigation_active && self.manga_total_height_cache_valid {
+                let viewport_bottom_idx = self.manga_index_at_y(
+                    self.manga_scroll_offset.max(0.0) + self.screen_size.y.max(1.0),
+                );
+                let min_updated = layout_dim_updates.iter().copied().min().unwrap_or(0);
+                if min_updated > viewport_bottom_idx.saturating_add(4) {
+                    self.manga_strip_deferred_dim_min_idx = Some(
+                        self.manga_strip_deferred_dim_min_idx
+                            .map_or(min_updated, |cur| cur.min(min_updated)),
+                    );
+                } else {
+                    self.invalidate_manga_layout_cache();
+                    dims_updated = true;
+                }
             } else {
                 self.invalidate_manga_layout_cache();
+                dims_updated = true;
             }
         }
 
@@ -209,58 +226,61 @@ impl ImageViewer {
         if mailbox_received {
             self.manga_decoded_mailbox.extend(new_decoded_images);
         }
-        let dims_updated = layout_dims_changed;
 
-        let visible_indices = self.manga_collect_visible_indices();
-        let visible_set: HashSet<usize> = visible_indices.iter().copied().collect();
+        let mut visible_indices = std::mem::take(&mut self.manga_visible_indices_scratch);
+        self.manga_collect_visible_indices_into(&mut visible_indices);
+        let mut visible_set = std::mem::take(&mut self.manga_visible_set_scratch);
+        visible_set.clear();
+        visible_set.extend(visible_indices.iter().copied());
         self.manga_visible_indices_last = visible_indices.len();
         self.manga_visible_indices_peak = self
             .manga_visible_indices_peak
             .max(self.manga_visible_indices_last);
         self.manga_texture_cache
-            .set_pinned_indices(visible_indices.iter().copied());
+            .set_pinned_indices_slice(&visible_indices);
 
         let upload_anchor_index = visible_indices.first().copied().unwrap_or(
             self.current_index
                 .min(self.image_list.len().saturating_sub(1)),
         );
         crate::diag::note_stage("mailbox_prune");
-        let near_radius = self.manga_prune_decoded_mailbox(
-            &visible_set,
-            upload_anchor_index,
-            defer_masonry_layout_work,
-        );
-        let eligible_uploads = if defer_masonry_layout_work {
+        let _near_radius =
+            self.manga_prune_decoded_mailbox(&visible_set, upload_anchor_index, navigation_active);
+        // During active scrolling, only upload currently visible (band 0) items; leave offscreen
+        // prefetch items queued in `manga_decoded_mailbox` to upload smoothly once scroll settles.
+        let eligible_uploads = if navigation_active {
             self.manga_decoded_mailbox
                 .iter()
-                .take_while(|decoded| {
-                    Self::manga_decoded_mailbox_band(
-                        decoded.index,
-                        &visible_set,
-                        upload_anchor_index,
-                        near_radius,
-                    ) <= 1
-                })
+                .take_while(|decoded| visible_set.contains(&decoded.index))
                 .count()
         } else {
             self.manga_decoded_mailbox.len()
         };
+        self.manga_visible_indices_scratch = visible_indices;
+        self.manga_visible_set_scratch = visible_set;
+
         let upload_count = upload_batch_limit.min(eligible_uploads);
-        let decoded_images: Vec<DecodedImage> = if upload_count == 0 {
-            Vec::new()
-        } else {
-            self.manga_decoded_mailbox.drain(0..upload_count).collect()
-        };
 
         crate::diag::note_stage("cache_evict");
         let mut evicted_to_mark_unloaded = self
             .manga_texture_cache
             .set_max_entries(self.manga_cache_target_capacity);
         let mut uploaded_textures = 0u64;
-        self.manga_upload_items_last_pass = decoded_images.len();
+        let mut processed_items = 0usize;
+        let upload_loop_start = Instant::now();
+        let inline_upload_budget =
+            Duration::from_secs_f32(self.manga_inline_upload_budget_ms(navigation_active) / 1000.0);
 
-        // Upload decoded images to GPU as textures
-        for decoded in decoded_images {
+        // Upload decoded images to GPU as textures within a strict refresh-rate-aware time budget.
+        while processed_items < upload_count {
+            if uploaded_textures > 0 && upload_loop_start.elapsed() >= inline_upload_budget {
+                break;
+            }
+            let Some(decoded) = self.manga_decoded_mailbox.pop_front() else {
+                break;
+            };
+            processed_items += 1;
+
             if !self
                 .image_list
                 .get(decoded.index)
@@ -308,7 +328,7 @@ impl ImageViewer {
             // Bookkeeping first: the loader already set `loaded_levels` for this decode, and a
             // level left set without a texture makes every re-request path treat the tile as
             // satisfied forever. `register_upload_failure` also keeps the retry backoff bounded.
-            if decoded.pixels.is_empty() {
+            if !decoded.has_pixels() {
                 // The loader already accounted for this empty payload in `publish_one`: a
                 // genuine decode failure spent one attempt there, and a gated-probe miss spent
                 // none. Counting it again here halved the budget towards a permanent
@@ -341,9 +361,10 @@ impl ImageViewer {
             // Never hand an oversized payload to the GPU: `color_image` would copy it whole and
             // texture creation would fail anyway. Treat it as an upload failure so the tile falls
             // back to the placeholder instead of pinning another full-size RGBA copy.
+            let decoded_pixel_bytes = decoded.pixel_bytes();
             if let Some(reason) = crate::texture_upload::oversized_payload_reason(
                 (decoded.width, decoded.height),
-                decoded.pixels.len(),
+                decoded_pixel_bytes,
                 self.max_texture_side,
             ) {
                 crate::diag::trace_file("upload-skip", || {
@@ -353,7 +374,7 @@ impl ImageViewer {
                         Self::diag_file_label(&decoded.path),
                         decoded.width,
                         decoded.height,
-                        decoded.pixels.len(),
+                        decoded_pixel_bytes,
                         reason
                     )
                 });
@@ -387,7 +408,7 @@ impl ImageViewer {
                 ctx,
                 &format!("manga_{}", decoded.index),
                 None,
-                crate::texture_upload::PixelSource::Rgba(&decoded.pixels),
+                crate::texture_upload::PixelSource::ColorImage(decoded.color_image),
                 (decoded.width, decoded.height),
                 &policy,
             )
@@ -406,7 +427,7 @@ impl ImageViewer {
                         decoded.original_height,
                         decoded.width,
                         decoded.height,
-                        decoded.pixels.len(),
+                        decoded_pixel_bytes,
                         upload_ms.as_millis()
                     )
                 });
@@ -434,7 +455,12 @@ impl ImageViewer {
             }
 
             evicted_to_mark_unloaded.extend(evicted);
+
+            if upload_loop_start.elapsed() >= inline_upload_budget {
+                break;
+            }
         }
+        self.manga_upload_items_last_pass = processed_items;
 
         if !evicted_to_mark_unloaded.is_empty() {
             if let Some(loader) = self.manga_loader.as_mut() {

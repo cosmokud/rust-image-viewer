@@ -389,4 +389,27 @@ impl ImageViewer {
             _ => inner_size,
         }
     }
+
+    /// Refreshes `fps_display_refresh_hz` from the monitor hosting the main window.
+    pub(crate) fn refresh_display_refresh_hz(&mut self, force: bool) {
+        #[cfg(target_os = "windows")]
+        let hwnd = self.resolved_main_hwnd() as isize;
+        #[cfg(not(target_os = "windows"))]
+        let hwnd = self.main_hwnd;
+
+        let hwnd_changed = hwnd != 0 && hwnd != self.last_monitor_refresh_hz_hwnd;
+        let interval_due =
+            self.last_monitor_refresh_hz_check_at.elapsed() >= Duration::from_millis(500);
+        if !force && !hwnd_changed && !interval_due {
+            return;
+        }
+
+        self.last_monitor_refresh_hz_check_at = Instant::now();
+        if hwnd != 0 {
+            self.last_monitor_refresh_hz_hwnd = hwnd;
+        }
+        if let Some(hz) = get_monitor_refresh_hz_for_hwnd(hwnd) {
+            self.fps_display_refresh_hz = Some(hz);
+        }
+    }
 }

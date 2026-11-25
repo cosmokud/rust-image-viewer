@@ -601,8 +601,12 @@ pub(crate) struct ImageViewer {
     pub(crate) fps_overlay_last_dt_s: f32,
     /// Last time we refreshed overlay FPS numbers.
     pub(crate) fps_overlay_last_update_at: Instant,
-    /// Primary monitor refresh rate used to keep FPS overlay vsync-aware.
+    /// Active monitor refresh rate used to keep FPS overlay & scroll physics vsync-aware.
     pub(crate) fps_display_refresh_hz: Option<f32>,
+    /// Last time the active window's monitor refresh rate was queried.
+    pub(crate) last_monitor_refresh_hz_check_at: Instant,
+    /// Last HWND used for monitor refresh-rate lookup.
+    pub(crate) last_monitor_refresh_hz_hwnd: isize,
 
     /// Whether we've installed extra Windows fonts for CJK filename rendering.
     /// These font files can be quite large, so we install them lazily only when needed.
@@ -672,6 +676,10 @@ pub(crate) struct ImageViewer {
     pub(crate) manga_scroll_velocity: f32,
     /// True while mouse-wheel momentum physics owns vertical strip scrolling.
     pub(crate) manga_wheel_scroll_active: bool,
+    /// Monotonic wall-clock timestamp of the previous active scroll physics tick.
+    pub(crate) last_manga_scroll_tick: Option<Instant>,
+    /// Cached per-frame scroll dt (seconds) shared between `handle_input` and `draw_manga_mode`.
+    pub(crate) manga_scroll_frame_dt_s: Option<f32>,
     /// High-performance parallel image loader for manga mode
     pub(crate) manga_loader: Option<MangaLoader>,
     /// Signature of the image list currently represented by `manga_loader.dimension_cache`.
@@ -687,7 +695,7 @@ pub(crate) struct ImageViewer {
     /// LRU texture cache for manga mode
     pub(crate) manga_texture_cache: MangaTextureCache,
     /// Decoded-image mailbox drained on the UI thread so visible uploads can win over speculative ones.
-    pub(crate) manga_decoded_mailbox: Vec<DecodedImage>,
+    pub(crate) manga_decoded_mailbox: VecDeque<DecodedImage>,
     /// Whether the scrollbar is being dragged
     pub(crate) manga_scrollbar_dragging: bool,
     /// Most recent time the masonry scrollbar thumb actually moved.
@@ -738,8 +746,25 @@ pub(crate) struct ImageViewer {
     /// Dimension/layout updates received while masonry navigation is active.
     /// These are applied once motion settles to avoid repeated expensive relayouts.
     pub(crate) masonry_layout_invalidation_deferred: bool,
+    /// Smallest Long Strip item index whose dimension update was deferred mid-scroll.
+    pub(crate) manga_strip_deferred_dim_min_idx: Option<usize>,
     /// Pending masonry dimension updates waiting to be committed into layout.
     pub(crate) masonry_pending_dimension_updates: HashSet<usize>,
+    /// Reusable per-frame scratch buffers to avoid hot-path allocations.
+    pub(crate) manga_visible_indices_scratch: Vec<usize>,
+    pub(crate) manga_visible_indices_draw_scratch: Vec<usize>,
+    pub(crate) manga_visible_set_scratch: HashSet<usize>,
+    pub(crate) manga_mailbox_budget_scratch: Vec<(usize, usize)>,
+    pub(crate) manga_repair_exhausted_scratch: Vec<usize>,
+    pub(crate) manga_repair_missing_scratch: Vec<usize>,
+    pub(crate) manga_preload_visible_scratch: Vec<usize>,
+    pub(crate) manga_cached_indices_scratch: Vec<usize>,
+    /// Cached visible set & inputs for skipping redundant `demand_outstanding` lock churn.
+    pub(crate) manga_demand_last_visible: Vec<usize>,
+    pub(crate) manga_demand_last_target_side: u32,
+    pub(crate) manga_demand_last_list_signature: u64,
+    pub(crate) manga_demand_last_layout: MangaLayoutMode,
+    pub(crate) manga_demand_last_checked_at: Instant,
 
     /// Whether startup metadata pre-scan is active for masonry mode.
     pub(crate) masonry_metadata_preload_active: bool,
@@ -1249,6 +1274,8 @@ impl Default for ImageViewer {
             fps_overlay_last_dt_s: 0.0,
             fps_overlay_last_update_at: Instant::now(),
             fps_display_refresh_hz: get_primary_monitor_refresh_hz(),
+            last_monitor_refresh_hz_check_at: Instant::now(),
+            last_monitor_refresh_hz_hwnd: 0,
 
             windows_cjk_fonts_installed: false,
             pending_windows_cjk_font_load: None,
@@ -1282,6 +1309,8 @@ impl Default for ImageViewer {
             manga_scroll_target: 0.0,
             manga_scroll_velocity: 0.0,
             manga_wheel_scroll_active: false,
+            last_manga_scroll_tick: None,
+            manga_scroll_frame_dt_s: None,
             manga_loader: None,
             manga_dimension_cache_list_signature: 0,
             masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache::new(
@@ -1290,7 +1319,7 @@ impl Default for ImageViewer {
             masonry_authoritative_dimension_signature: 0,
             masonry_authoritative_dimension_folder: None,
             manga_texture_cache: MangaTextureCache::default(),
-            manga_decoded_mailbox: Vec::new(),
+            manga_decoded_mailbox: VecDeque::new(),
             manga_scrollbar_dragging: false,
             masonry_scrollbar_last_motion_at: None,
             masonry_autoscroll_last_motion_at: None,
@@ -1318,7 +1347,21 @@ impl Default for ImageViewer {
             masonry_layout_list_signature: 0,
             masonry_layout_valid: false,
             masonry_layout_invalidation_deferred: false,
+            manga_strip_deferred_dim_min_idx: None,
             masonry_pending_dimension_updates: HashSet::new(),
+            manga_visible_indices_scratch: Vec::new(),
+            manga_visible_indices_draw_scratch: Vec::new(),
+            manga_visible_set_scratch: HashSet::new(),
+            manga_mailbox_budget_scratch: Vec::new(),
+            manga_repair_exhausted_scratch: Vec::new(),
+            manga_repair_missing_scratch: Vec::new(),
+            manga_preload_visible_scratch: Vec::new(),
+            manga_cached_indices_scratch: Vec::new(),
+            manga_demand_last_visible: Vec::new(),
+            manga_demand_last_target_side: 0,
+            manga_demand_last_list_signature: 0,
+            manga_demand_last_layout: MangaLayoutMode::LongStrip,
+            manga_demand_last_checked_at: Instant::now(),
 
             masonry_metadata_preload_active: false,
             masonry_metadata_preload_total: 0,

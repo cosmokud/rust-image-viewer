@@ -149,6 +149,7 @@ impl ImageViewer {
         self.zoom *= inverse_scale;
         self.zoom_target *= inverse_scale;
         self.offset *= inverse_scale;
+        self.refresh_display_refresh_hz(true);
         crate::diag::trace(
             "rect",
             &format!(

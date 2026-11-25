@@ -184,7 +184,7 @@ impl MangaLoader {
                         // A decoded payload with empty pixels/dimensions is still useful for metadata
                         // (e.g., video dimension fallback), but does not satisfy texture preloading.
                         let has_usable_pixels =
-                            !decoded.pixels.is_empty() && decoded.width > 0 && decoded.height > 0;
+                            decoded.has_pixels() && decoded.width > 0 && decoded.height > 0;
                         // A gated-probe miss is not a file failure: counting it spent the whole
                         // video retry budget in one or two frame passes and the tile then never
                         // re-requested itself for the session.

@@ -43,33 +43,81 @@ impl ImageViewer {
         }
     }
 
+    pub(crate) fn seeded_manga_scroll_frame_dt(&self) -> f32 {
+        let hz = self
+            .fps_display_refresh_hz
+            .filter(|hz| hz.is_finite() && *hz >= 24.0 && *hz <= 1000.0)
+            .unwrap_or(60.0);
+        (1.0 / hz).clamp(1.0 / 500.0, 1.0 / 30.0)
+    }
+
+    /// Monotonic wall-clock `dt` for strip/masonry vertical scroll physics.
+    /// When starting from idle (`last_manga_scroll_tick` is `None` or elapsed > 50ms),
+    /// seeds `dt` from the hosting monitor's actual frame period `1.0 / current_monitor_hz`
+    /// so frame 1 never jumps at 60Hz (`16.67ms`) on 144Hz/200Hz+ displays.
+    pub(crate) fn advance_manga_scroll_dt_at(&mut self, now: Instant) -> f32 {
+        if let Some(dt) = self.manga_scroll_frame_dt_s {
+            return dt;
+        }
+        const IDLE_RESET_THRESHOLD: Duration = Duration::from_millis(50);
+        let dt = match self.last_manga_scroll_tick {
+            Some(prev) => {
+                let elapsed = now.saturating_duration_since(prev);
+                if elapsed > IDLE_RESET_THRESHOLD {
+                    self.seeded_manga_scroll_frame_dt()
+                } else {
+                    elapsed.as_secs_f32().clamp(0.0, 1.0 / 30.0)
+                }
+            }
+            None => self.seeded_manga_scroll_frame_dt(),
+        };
+        self.last_manga_scroll_tick = Some(now);
+        self.manga_scroll_frame_dt_s = Some(dt);
+        dt
+    }
+
+    pub(crate) fn manga_frame_scroll_dt(&mut self) -> f32 {
+        self.advance_manga_scroll_dt_at(Instant::now())
+    }
+
     pub(crate) fn manga_tick_wheel_scroll_animation(&mut self, dt: f32, max_scroll: f32) -> bool {
         const SNAP_POSITION_EPSILON: f32 = 0.5;
         const SNAP_VELOCITY_EPSILON: f32 = 6.0;
 
+        let dt = dt.clamp(0.0, 1.0 / 30.0);
         let decay_rate = self.config.manga_wheel_decay_rate.clamp(0.5, 40.0);
         let spring_hz = self.config.manga_wheel_edge_spring_hz.clamp(0.5, 20.0);
         let omega = 2.0 * std::f32::consts::PI * spring_hz;
-        let omega_sq = omega * omega;
         let max_overscroll = (self.screen_size.y * 0.12).clamp(36.0, 180.0);
 
         let boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
         let overscroll = self.manga_scroll_offset - boundary;
 
-        if overscroll.abs() > f32::EPSILON {
-            let acceleration = -omega_sq * overscroll - 2.0 * omega * self.manga_scroll_velocity;
-            self.manga_scroll_velocity += acceleration * dt;
-            self.manga_scroll_offset += self.manga_scroll_velocity * dt;
-        } else {
-            let decay = (-decay_rate * dt).exp();
-            let displacement = self.manga_scroll_velocity * (1.0 - decay) / decay_rate;
-            self.manga_scroll_offset += displacement;
-            self.manga_scroll_velocity *= decay;
+        if dt > 0.0 {
+            if overscroll.abs() > f32::EPSILON {
+                // Exact analytical critically-damped spring (`zeta = 1.0`) for frame-rate independence.
+                let exp = (-omega * dt).exp();
+                let c = self.manga_scroll_velocity + omega * overscroll;
+                let new_overscroll = (overscroll + c * dt) * exp;
+                let new_velocity = (self.manga_scroll_velocity - omega * c * dt) * exp;
+                self.manga_scroll_offset = boundary + new_overscroll;
+                self.manga_scroll_velocity = new_velocity;
+            } else {
+                let decay = (-decay_rate * dt).exp();
+                let displacement = self.manga_scroll_velocity * (1.0 - decay) / decay_rate;
+                self.manga_scroll_offset += displacement;
+                self.manga_scroll_velocity *= decay;
+            }
         }
 
-        self.manga_scroll_offset = self
-            .manga_scroll_offset
-            .clamp(-max_overscroll, max_scroll + max_overscroll);
+        let unclamped = self.manga_scroll_offset;
+        let clamped = unclamped.clamp(-max_overscroll, max_scroll + max_overscroll);
+        self.manga_scroll_offset = clamped;
+        if clamped < unclamped && self.manga_scroll_velocity > 0.0 {
+            self.manga_scroll_velocity = 0.0;
+        } else if clamped > unclamped && self.manga_scroll_velocity < 0.0 {
+            self.manga_scroll_velocity = 0.0;
+        }
         self.manga_scroll_target = self.manga_scroll_offset.clamp(0.0, max_scroll);
 
         self.manga_update_current_index();
@@ -123,7 +171,7 @@ impl ImageViewer {
         }
 
         // Cap dt to keep behavior stable across frame drops.
-        let dt = dt.clamp(0.0, 0.033);
+        let dt = dt.clamp(0.0, 1.0 / 30.0);
 
         // Clamp target first so we never chase an invalid position.
         let total_height = self.manga_total_height();
@@ -145,6 +193,10 @@ impl ImageViewer {
             return false;
         }
 
+        if dt <= 0.0 {
+            return true;
+        }
+
         // Convert a "per-60fps-frame" friction into a dt-independent alpha.
         // If friction=0.12 and dt=1/60, alpha=0.12.
         //
@@ -154,15 +206,16 @@ impl ImageViewer {
         let base_friction = self.config.manga_inertial_friction.clamp(0.01, 0.5);
         let catchup_t = (diff.abs() / 800.0).clamp(0.0, 1.0);
         let friction = base_friction + (0.25 - base_friction) * catchup_t;
-        let alpha = 1.0 - (1.0 - friction).powf((dt * 60.0).clamp(0.0, 10.0));
+        let dt_60 = (dt * 60.0).clamp(0.0, 10.0);
+        let alpha = 1.0 - (1.0 - friction).powf(dt_60);
 
         let prev_offset = self.manga_scroll_offset;
         self.manga_scroll_offset += diff * alpha;
         self.manga_scroll_offset = self.manga_scroll_offset.clamp(0.0, max_scroll);
 
         // Maintain a smoothed velocity estimate for momentum/idle detection.
-        let instant_velocity = (self.manga_scroll_offset - prev_offset) / dt.max(0.001);
-        let velocity_alpha = 0.35;
+        let instant_velocity = (self.manga_scroll_offset - prev_offset) / dt.max(0.0005);
+        let velocity_alpha = 1.0 - (1.0 - 0.35_f32).powf(dt_60);
         self.manga_scroll_velocity =
             self.manga_scroll_velocity * (1.0 - velocity_alpha) + instant_velocity * velocity_alpha;
 

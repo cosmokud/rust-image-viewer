@@ -43,12 +43,12 @@ pub enum MangaMediaType {
     Video,
 }
 
-/// A decoded image ready for GPU upload.
+/// A decoded image ready for GPU upload (pre-converted & premultiplied off the UI thread).
 #[derive(Clone)]
 pub struct DecodedImage {
     pub index: usize,
     pub path: PathBuf,
-    pub pixels: Vec<u8>,
+    pub color_image: egui::ColorImage,
     pub width: u32,
     pub height: u32,
     /// Original dimensions from file header (may differ from texture dims if downscaled)
@@ -67,6 +67,21 @@ pub struct DecodedImage {
     /// Payload carries no texture because a gated probe could not run (permit timeout or cooldown),
     /// not because the file failed: it must not spend the index's retry budget.
     pub deferred: bool,
+}
+
+impl DecodedImage {
+    #[inline]
+    pub fn pixel_bytes(&self) -> usize {
+        self.color_image
+            .pixels
+            .len()
+            .saturating_mul(std::mem::size_of::<egui::Color32>())
+    }
+
+    #[inline]
+    pub fn has_pixels(&self) -> bool {
+        !self.color_image.pixels.is_empty()
+    }
 }
 
 /// Request sent to the loader thread pool.

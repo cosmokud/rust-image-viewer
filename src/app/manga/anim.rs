@@ -87,36 +87,71 @@ impl ImageViewer {
     /// Outstanding-demand signal for the preload pump: a visible item is neither in flight nor
     /// loaded at the target LOD. Level-triggered, unlike the in-flight backlog counters.
     /// `visible` is the active mode's visible set (masonry, strip or collected fallback).
-    pub(crate) fn manga_refresh_demand_outstanding(&mut self, visible: Option<&[usize]>) -> bool {
+    pub(crate) fn manga_refresh_demand_outstanding_with_hints(
+        &mut self,
+        visible: Option<&[usize]>,
+        force_recheck: bool,
+    ) -> bool {
         let outstanding = if self.mode().is_solo() || self.image_list.is_empty() {
+            self.manga_demand_last_visible.clear();
             false
         } else {
-            let collected;
+            let mut scratch_owned = None;
             let indices: &[usize] = match visible {
                 Some(indices) => indices,
                 None => {
-                    collected = self.manga_collect_visible_indices();
-                    &collected
+                    let mut buf = std::mem::take(&mut self.manga_visible_indices_scratch);
+                    self.manga_collect_visible_indices_into(&mut buf);
+                    scratch_owned = Some(buf);
+                    scratch_owned.as_deref().unwrap_or(&[])
                 }
             };
-            crate::diag::note_stage("preload_pump");
-            self.manga_refresh_unloadable_media();
-            let bookkeeping = self.manga_loader.as_ref().is_some_and(|loader| {
-                loader.demand_outstanding(
-                    &self.image_list,
-                    indices,
-                    self.max_texture_side,
-                    self.manga_target_texture_side,
-                )
-            });
-            // Loader bookkeeping alone can read "satisfied" forever while the tile renders a
-            // placeholder (level set by a decode that never reached the GPU). The texture cache
-            // is the only truth for what is actually drawn.
-            let missing = self.manga_repair_visible_textures(indices);
-            // A tile waiting out a gate backoff (or a video revive window) is not issuable
-            // demand: `demand_outstanding` reports it as settled and the parked loop is woken by
-            // `manga_probe_blocked_wake` / `manga_video_revive_wake` at the exact deadline.
-            bookkeeping || missing
+
+            let layout = self.mode().layout();
+            let same_visible_set = !force_recheck
+                && !self.manga_demand_outstanding
+                && self.manga_uploads_last_pass == 0
+                && self.manga_demand_last_target_side == self.manga_target_texture_side
+                && self.manga_demand_last_list_signature == self.image_list_signature
+                && self.manga_demand_last_layout == layout
+                && self.manga_demand_last_checked_at.elapsed() < Duration::from_millis(50)
+                && indices == self.manga_demand_last_visible.as_slice();
+
+            let result = if same_visible_set {
+                false
+            } else {
+                crate::diag::note_stage("preload_pump");
+                self.manga_refresh_unloadable_media();
+                let bookkeeping = self.manga_loader.as_ref().is_some_and(|loader| {
+                    loader.demand_outstanding(
+                        &self.image_list,
+                        indices,
+                        self.max_texture_side,
+                        self.manga_target_texture_side,
+                    )
+                });
+                // Loader bookkeeping alone can read "satisfied" forever while the tile renders a
+                // placeholder (level set by a decode that never reached the GPU). The texture cache
+                // is the only truth for what is actually drawn.
+                let missing = self.manga_repair_visible_textures(indices);
+
+                self.manga_demand_last_visible.clear();
+                self.manga_demand_last_visible.extend_from_slice(indices);
+                self.manga_demand_last_target_side = self.manga_target_texture_side;
+                self.manga_demand_last_list_signature = self.image_list_signature;
+                self.manga_demand_last_layout = layout;
+                self.manga_demand_last_checked_at = Instant::now();
+
+                // A tile waiting out a gate backoff (or a video revive window) is not issuable
+                // demand: `demand_outstanding` reports it as settled and the parked loop is woken by
+                // `manga_probe_blocked_wake` / `manga_video_revive_wake` at the exact deadline.
+                bookkeeping || missing
+            };
+
+            if let Some(buf) = scratch_owned {
+                self.manga_visible_indices_scratch = buf;
+            }
+            result
         };
         self.manga_demand_outstanding = outstanding;
         outstanding

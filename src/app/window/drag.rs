@@ -103,10 +103,21 @@ impl ImageViewer {
         ctx.request_repaint();
     }
 
-    pub(crate) fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
-        let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier;
+    pub(crate) fn apply_manga_pan_step_with_dt(
+        &mut self,
+        direction: f32,
+        multiplier: f32,
+        dt: f32,
+    ) {
+        let dt = dt.clamp(0.0, 1.0 / 30.0);
+        let scroll_amount = self.config.manga_arrow_scroll_speed * 0.5 * multiplier * (dt * 60.0);
         if self.manga_add_scroll_target_delta(direction * scroll_amount) {
             self.manga_update_preload_queue();
         }
+    }
+
+    pub(crate) fn apply_manga_pan_step(&mut self, direction: f32, multiplier: f32) {
+        let dt = self.manga_frame_scroll_dt();
+        self.apply_manga_pan_step_with_dt(direction, multiplier, dt);
     }
 }

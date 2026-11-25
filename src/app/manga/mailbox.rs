@@ -57,6 +57,30 @@ impl ImageViewer {
         Some((sorted[p50_idx], sorted[p95_idx], n))
     }
 
+    pub(crate) fn current_frame_budget_ms(&self) -> f32 {
+        let hz = self
+            .fps_display_refresh_hz
+            .filter(|hz| hz.is_finite() && *hz >= 24.0 && *hz <= 1000.0)
+            .unwrap_or(60.0);
+        1000.0 / hz
+    }
+
+    pub(crate) fn manga_inline_upload_budget_ms(&self, navigation_active: bool) -> f32 {
+        let frame_budget_ms = self.current_frame_budget_ms();
+        if navigation_active {
+            (frame_budget_ms * 0.25).clamp(0.8, 2.0)
+        } else {
+            (frame_budget_ms * 0.45).clamp(1.8, 6.0)
+        }
+    }
+
+    pub(crate) fn manga_upload_p95_soft_hard_budgets_ms(&self) -> (f32, f32) {
+        let frame_budget_ms = self.current_frame_budget_ms();
+        let soft = (frame_budget_ms * 0.27).clamp(1.1, Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS);
+        let hard = (frame_budget_ms * 0.45).clamp(1.8, Self::MANGA_UPLOAD_P95_HARD_BUDGET_MS);
+        (soft, hard)
+    }
+
     pub(crate) fn manga_compute_upload_batch_limit(
         &self,
         pending_loads: usize,
@@ -96,34 +120,41 @@ impl ImageViewer {
             limit += 2;
         }
 
-        // Adapt upload budget to measured upload pass latency.
+        let frame_budget_ms = self.current_frame_budget_ms();
+        let (soft_budget_ms, hard_budget_ms) = self.manga_upload_p95_soft_hard_budgets_ms();
+
+        // Adapt upload budget to measured upload pass latency, scaled to display refresh period.
         if let Some(upload_p95_ms) = self.perf_metrics.p95(Metric::MangaUploadPassMs) {
-            if upload_p95_ms >= Self::MANGA_UPLOAD_P95_HARD_BUDGET_MS {
+            if upload_p95_ms >= hard_budget_ms {
                 limit = limit.saturating_sub(4);
-            } else if upload_p95_ms >= Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS {
+            } else if upload_p95_ms >= soft_budget_ms {
                 limit = limit.saturating_sub(2);
-            } else if upload_p95_ms <= 1.5 && pending_decoded >= 6 {
+            } else if upload_p95_ms <= soft_budget_ms * 0.35 && pending_decoded >= 6 {
                 limit += 1;
             }
         }
 
-        // Guard UI smoothness by reacting to recent frame time.
+        // Guard UI smoothness by reacting to recent frame time relative to display refresh period.
         // `fps_last_dt_s` is updated from active render frames only.
         if self.fps_last_dt_s.is_finite() && self.fps_last_dt_s > 0.0 {
             let frame_ms = self.fps_last_dt_s * 1000.0;
-            if frame_ms >= 22.0 {
+            if frame_ms >= frame_budget_ms * 1.30 {
                 limit = limit.saturating_sub(2);
-            } else if frame_ms >= 18.0 {
+            } else if frame_ms >= frame_budget_ms * 1.08 {
                 limit = limit.saturating_sub(1);
-            } else if frame_ms <= 12.5 && pending_decoded >= 10 {
+            } else if frame_ms <= frame_budget_ms * 0.75 && pending_decoded >= 10 {
                 limit += 1;
             }
         }
 
-        // During active masonry navigation, prioritize frame-time consistency over fill rate.
-        // Keeping upload batches tiny avoids UI-thread upload bursts that cause micro-stutter.
-        if self.masonry_navigation_active_for_heavy_work() {
-            return Self::MANGA_UPLOAD_BATCH_MIN;
+        // During active scroll/navigation in any vertical-scroll view, prioritize frame-time
+        // consistency over fill rate to avoid UI-thread upload bursts.
+        if self.manga_navigation_active_for_heavy_work() {
+            return if self.mode().is_masonry() {
+                Self::MANGA_UPLOAD_BATCH_MIN
+            } else {
+                1
+            };
         }
 
         limit.clamp(Self::MANGA_UPLOAD_BATCH_MIN, Self::MANGA_UPLOAD_BATCH_MAX)
@@ -156,28 +187,30 @@ impl ImageViewer {
             visible_set.len().max(2)
         };
 
-        self.manga_decoded_mailbox.sort_by_key(|decoded| {
-            let band = Self::manga_decoded_mailbox_band(
-                decoded.index,
-                visible_set,
-                anchor_index,
-                near_radius,
-            );
-            let distance = decoded.index.abs_diff(anchor_index);
-            let media_penalty = if navigation_active && decoded.media_type == MangaMediaType::Video
-            {
-                1u8
-            } else {
-                0u8
-            };
-            let lod_penalty = if navigation_active {
-                decoded.requested_side
-            } else {
-                0
-            };
+        self.manga_decoded_mailbox
+            .make_contiguous()
+            .sort_by_key(|decoded| {
+                let band = Self::manga_decoded_mailbox_band(
+                    decoded.index,
+                    visible_set,
+                    anchor_index,
+                    near_radius,
+                );
+                let distance = decoded.index.abs_diff(anchor_index);
+                let media_penalty =
+                    if navigation_active && decoded.media_type == MangaMediaType::Video {
+                        1u8
+                    } else {
+                        0u8
+                    };
+                let lod_penalty = if navigation_active {
+                    decoded.requested_side
+                } else {
+                    0
+                };
 
-            (band, distance, media_penalty, lod_penalty)
-        });
+                (band, distance, media_penalty, lod_penalty)
+            });
 
         near_radius
     }
@@ -228,22 +261,29 @@ impl ImageViewer {
             navigation_active,
         );
 
-        let budget: Vec<(usize, usize)> = self
-            .manga_decoded_mailbox
-            .iter()
-            .map(|decoded| (decoded.index, decoded.pixels.len()))
-            .collect();
+        let mut budget = std::mem::take(&mut self.manga_mailbox_budget_scratch);
+        budget.clear();
+        budget.extend(
+            self.manga_decoded_mailbox
+                .iter()
+                .map(|decoded| (decoded.index, decoded.pixel_bytes())),
+        );
         let keep = Self::manga_decoded_mailbox_keep_count(&budget, visible_set);
+        self.manga_mailbox_budget_scratch = budget;
 
         if keep >= self.manga_decoded_mailbox.len() {
             return near_radius;
         }
 
-        let dropped: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(keep..).collect();
-        let dropped_count = dropped.len() as u64;
-
+        let dropped_count = (self.manga_decoded_mailbox.len() - keep) as u64;
         if let Some(loader) = self.manga_loader.as_mut() {
-            loader.forget_indices(dropped.into_iter().map(|decoded| decoded.index));
+            loader.forget_indices(
+                self.manga_decoded_mailbox
+                    .drain(keep..)
+                    .map(|decoded| decoded.index),
+            );
+        } else {
+            self.manga_decoded_mailbox.truncate(keep);
         }
 
         if dropped_count > 0 {

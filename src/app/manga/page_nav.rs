@@ -292,6 +292,7 @@ impl ImageViewer {
         self.manga_scroll_offset = 0.0;
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
+        self.last_manga_scroll_tick = None;
         self.set_current_index_clamped(0);
         // Invalidate height cache since we're at a new position
         self.invalidate_manga_layout_cache();
@@ -323,6 +324,7 @@ impl ImageViewer {
         self.manga_scroll_offset = target;
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
+        self.last_manga_scroll_tick = None;
         // Immediately trigger preload for new position (no cooldown)
         self.manga_preload_cooldown = 0;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);

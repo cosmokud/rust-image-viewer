@@ -126,7 +126,7 @@ pub(crate) fn get_primary_monitor_refresh_hz() -> Option<f32> {
         }
 
         let hz = dev_mode.dmDisplayFrequency as f32;
-        if hz.is_finite() && hz >= 24.0 && hz <= 1000.0 {
+        if hz.is_finite() && (24.0..=1000.0).contains(&hz) {
             Some(hz)
         } else {
             None
@@ -137,6 +137,57 @@ pub(crate) fn get_primary_monitor_refresh_hz() -> Option<f32> {
 #[cfg(not(target_os = "windows"))]
 pub(crate) fn get_primary_monitor_refresh_hz() -> Option<f32> {
     None
+}
+
+/// Refresh rate (Hz) of the monitor currently hosting `hwnd`, falling back to the primary display.
+#[cfg(target_os = "windows")]
+pub(crate) fn get_monitor_refresh_hz_for_hwnd(hwnd: isize) -> Option<f32> {
+    use std::mem::{size_of, zeroed};
+    use winapi::shared::windef::HWND;
+    use winapi::um::wingdi::DEVMODEW;
+    use winapi::um::winuser::{
+        EnumDisplaySettingsW, GetMonitorInfoW, IsWindow, MonitorFromWindow, ENUM_CURRENT_SETTINGS,
+        MONITORINFO, MONITORINFOEXW, MONITOR_DEFAULTTONEAREST,
+    };
+
+    let hwnd = hwnd as HWND;
+    if !hwnd.is_null() {
+        unsafe {
+            if IsWindow(hwnd) != 0 {
+                let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+                if !monitor.is_null() {
+                    let mut info: MONITORINFOEXW = zeroed();
+                    info.cbSize = size_of::<MONITORINFOEXW>() as u32;
+                    if GetMonitorInfoW(
+                        monitor,
+                        (&mut info as *mut MONITORINFOEXW).cast::<MONITORINFO>(),
+                    ) != 0
+                    {
+                        let mut dev_mode: DEVMODEW = zeroed();
+                        dev_mode.dmSize = size_of::<DEVMODEW>() as u16;
+                        if EnumDisplaySettingsW(
+                            info.szDevice.as_ptr(),
+                            ENUM_CURRENT_SETTINGS,
+                            &mut dev_mode,
+                        ) != 0
+                        {
+                            let hz = dev_mode.dmDisplayFrequency as f32;
+                            if hz.is_finite() && (24.0..=1000.0).contains(&hz) {
+                                return Some(hz);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    get_primary_monitor_refresh_hz()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn get_monitor_refresh_hz_for_hwnd(_hwnd: isize) -> Option<f32> {
+    get_primary_monitor_refresh_hz()
 }
 
 /// Get the global cursor position in screen coordinates using Windows API.

@@ -16,8 +16,9 @@ impl eframe::App for ImageViewer {
         crate::diag::note_frame_start();
         crate::diag::note_stage("update");
 
-        // Reset per-frame repaint tracking
+        // Reset per-frame repaint tracking and per-frame scroll dt cache
         self.needs_repaint = false;
+        self.manga_scroll_frame_dt_s = None;
 
         let viewport_close_requested = ctx.input(|input| input.viewport().close_requested());
         let viewer_close_requested = viewport_close_requested || self.pending_viewer_close;
@@ -152,6 +153,7 @@ impl eframe::App for ImageViewer {
         }
 
         self.handle_masonry_preload_focus_loss(ctx);
+        self.refresh_display_refresh_hz(false);
         self.update_pointer_activity_tracking(ctx);
 
         // Update FPS stats for the debug overlay (and for general diagnostics).
@@ -709,23 +711,29 @@ impl eframe::App for ImageViewer {
         let masonry_metadata_preload_running = self.mode().is_manga()
             && self.mode().is_masonry()
             && self.masonry_metadata_preload_active;
+        let manga_mailbox_pending =
+            self.mode().is_manga() && !self.manga_decoded_mailbox.is_empty();
         let manga_background_work_pending = self.mode().is_manga()
             && (manga_pending_loads > 0
                 || manga_pending_decoded > 0
+                || manga_mailbox_pending
                 || manga_pending_dimensions > 0
                 || manga_pending_dimension_probes > 0
                 || self.manga_demand_outstanding
                 || masonry_metadata_preload_running);
+        let manga_upload_catchup_pending =
+            self.mode().is_manga() && (manga_mailbox_pending || manga_pending_decoded > 0);
         let manga_needs_fast_background_poll = self.mode().is_manga()
             && (masonry_metadata_preload_running
                 || !self.manga_ttv_pending.is_empty()
-                || manga_pending_decoded > 0
                 || manga_pending_dimensions > 0
                 || manga_pending_dimension_probes > 0);
         let manga_scroll_active = self.mode().is_manga()
             && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
                 || self.manga_scroll_velocity.abs() > 0.5
-                || self.manga_wheel_scroll_active);
+                || self.manga_wheel_scroll_active
+                || self.manga_scrollbar_dragging
+                || self.manga_shift_wheel_pan_velocity_x.abs() > 0.01);
         // Check if configured strip/masonry hold bindings are active for continuous scrolling.
         let manga_arrow_held = self.mode().is_manga()
             && self.mode().is_fullscreen()
@@ -762,6 +770,14 @@ impl eframe::App for ImageViewer {
                             shift,
                             alt,
                         )
+                        || self.action_binding_down(
+                            Action::MangaPreviousImage,
+                            input,
+                            ctrl,
+                            shift,
+                            alt,
+                        )
+                        || self.action_binding_down(Action::MangaNextImage, input, ctrl, shift, alt)
                         || self.action_binding_down(Action::MangaPanUp, input, ctrl, shift, alt)
                         || self.action_binding_down(Action::MangaPanDown, input, ctrl, shift, alt)
                 }
@@ -793,6 +809,7 @@ impl eframe::App for ImageViewer {
             || media_load_pending
             || manga_video_load_pending
             || self.pending_media_layout
+            || manga_upload_catchup_pending
             || manga_needs_fast_background_poll
             || manga_background_work_pending
             || manga_video_playing
@@ -826,15 +843,9 @@ impl eframe::App for ImageViewer {
             repaint_reason = "startup-uncloak";
             ctx.request_repaint();
         } else if any_animation_active {
-            if self.masonry_navigation_active_for_heavy_work() {
-                // Pace active masonry redraws near high-refresh cadence instead of spinning
-                // the UI thread as fast as possible under load.
-                repaint_reason = "animation-masonry-7ms";
-                ctx.request_repaint_after(Duration::from_millis(7));
-            } else {
-                repaint_reason = "animation-immediate";
-                ctx.request_repaint();
-            }
+            // Pace all active vertical-scroll views (Masonry, Gallery, Long Strip) 1:1 with VSync.
+            repaint_reason = "animation-immediate";
+            ctx.request_repaint();
         } else if let Some(grace_remaining) = floating_zoom_settle_grace {
             // Quiet settle grace after spring rest: sleep cheaply without spinning CPU/DWM;
             // any wheel tick, click, or key wakes immediately via `request_repaint()`.
@@ -850,9 +861,15 @@ impl eframe::App for ImageViewer {
         } else if self.pending_media_layout {
             repaint_reason = "pending-layout";
             ctx.request_repaint_after(Duration::from_millis(16));
+        } else if manga_upload_catchup_pending {
+            // Post-scroll upload catch-up: drain mailbox/decoded items smoothly across VSync frames
+            // within the per-frame time budget without throttling to 60Hz.
+            repaint_reason = "manga-upload-catchup";
+            ctx.request_repaint();
         } else if manga_needs_fast_background_poll {
-            repaint_reason = "manga-background-16ms";
-            ctx.request_repaint_after(Duration::from_millis(16));
+            let poll_secs = (self.current_frame_budget_ms() / 1000.0).clamp(0.002, 0.016);
+            repaint_reason = "manga-background-refresh";
+            ctx.request_repaint_after(Duration::from_secs_f32(poll_secs));
         } else if manga_background_work_pending {
             repaint_reason = "manga-background-66ms";
             ctx.request_repaint_after(Duration::from_millis(66));

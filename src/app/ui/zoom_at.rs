@@ -68,7 +68,7 @@ impl ImageViewer {
 
         let max_side = self.max_texture_side.max(1);
         let is_masonry = self.mode().is_masonry();
-        let prefer_visible_quality_during_autoscroll = is_masonry && self.manga_autoscroll_active;
+        let prefer_visible_quality_during_autoscroll = self.manga_autoscroll_active;
         let defer_visible_quality =
             navigation_active_for_visible_retry && !prefer_visible_quality_during_autoscroll;
         let min_target_side = if is_masonry {

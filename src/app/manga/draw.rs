@@ -31,11 +31,31 @@ impl ImageViewer {
 
         self.manga_prune_ttv_pending();
 
-        if self.masonry_layout_invalidation_deferred
-            && !self.masonry_navigation_active_for_heavy_work()
-        {
-            let force_flush = !self.masonry_metadata_preload_active;
-            self.masonry_flush_pending_dimension_updates(force_flush);
+        if self.mode().is_masonry() {
+            if self.masonry_layout_invalidation_deferred
+                && !self.masonry_navigation_active_for_heavy_work()
+            {
+                let force_flush = !self.masonry_metadata_preload_active;
+                self.masonry_flush_pending_dimension_updates(force_flush);
+            }
+        } else if let Some(min_deferred_idx) = self.manga_strip_deferred_dim_min_idx {
+            let nav_active = self.manga_navigation_active_for_heavy_work();
+            let viewport_near_deferred = if nav_active && self.manga_total_height_cache_valid {
+                let viewport_bottom_idx = self.manga_index_at_y(
+                    self.manga_scroll_offset.max(0.0) + self.screen_size.y.max(1.0),
+                );
+                viewport_bottom_idx.saturating_add(4) >= min_deferred_idx
+            } else {
+                false
+            };
+            if !nav_active || viewport_near_deferred {
+                let anchor = self.manga_capture_scroll_anchor();
+                self.invalidate_manga_layout_cache();
+                if let Some(anchor) = anchor {
+                    self.manga_apply_scroll_anchor(anchor);
+                    self.manga_update_current_index();
+                }
+            }
         }
 
         if self.mode().is_masonry() && self.masonry_metadata_preload_active {
@@ -231,26 +251,6 @@ impl ImageViewer {
         let controls_bar_height = 56.0;
         let over_controls =
             pointer_pos.map_or(false, |p| p.y > screen_height - controls_bar_height);
-
-        if self.mode().is_masonry() {
-            let masonry_hover_blocked = title_ui_blocking
-                || self.file_action_menu.is_some()
-                || self.any_modal_dialog_open();
-            if !masonry_hover_blocked {
-                let hover_candidate =
-                    pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
-                if let Some(idx) = hover_candidate {
-                    self.manga_hovered_media_index = Some(idx);
-                }
-            } else {
-                self.manga_hovered_media_index = None;
-            }
-        } else if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
-            self.manga_hovered_media_index =
-                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
-        } else {
-            self.manga_hovered_media_index = None;
-        }
 
         let mut primary_consumed_for_autoscroll = false;
         let mut secondary_consumed_for_autoscroll = false;
@@ -849,7 +849,15 @@ impl ImageViewer {
             self.manga_scroll_target = self.manga_scroll_offset;
         }
 
-        let dt = ctx.input(|i| i.stable_dt).clamp(0.0, 0.033);
+        let scroll_motion_active = self.manga_shift_wheel_pan_velocity_x.abs() > 0.01
+            || self.manga_autoscroll_active
+            || self.manga_wheel_scroll_active
+            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5;
+        let dt = if scroll_motion_active {
+            self.manga_frame_scroll_dt()
+        } else {
+            0.0
+        };
 
         if self.manga_shift_wheel_pan_velocity_x.abs() > 0.01 && dt > 0.0 {
             self.offset.x += self.manga_shift_wheel_pan_velocity_x * dt;
@@ -937,26 +945,37 @@ impl ImageViewer {
             self.manga_update_preload_queue();
         }
 
-        let masonry_navigation_active_for_visible_retry = self.mode().is_masonry()
-            && (self.is_panning
-                || self.mark_selection_box.is_some()
-                || self.manga_zoom_plus_held
-                || self.manga_zoom_minus_held
-                || self.manga_wheel_scroll_active
-                || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
-                || self.manga_scroll_velocity.abs() > 0.25
-                || self.manga_video_seeking
-                || self.manga_video_volume_dragging
-                || self.gif_seeking
-                || masonry_scrollbar_moved_this_frame
-                || masonry_autoscroll_moved_this_frame
-                || masonry_scroll_animation_moved_this_frame
-                || wheel_steps != 0.0
-                || wheel_steps_ctrl != 0.0
-                || wheel_steps_shift != 0.0
-                || (ctrl_held
-                    && (manga_ctrl_scroll_pan_bound || manga_ctrl_scroll_zoom_bound)
-                    && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0)));
+        // Reset monotonic tick once scroll physics settles so the next gesture starts cleanly.
+        if !self.manga_wheel_scroll_active
+            && (self.manga_scroll_target - self.manga_scroll_offset).abs() <= 0.5
+            && self.manga_scroll_velocity.abs() <= 0.01
+            && self.manga_shift_wheel_pan_velocity_x.abs() <= 0.01
+            && !self.manga_autoscroll_active
+        {
+            self.last_manga_scroll_tick = None;
+        }
+
+        let strip_navigation_active_for_visible_retry = self.is_panning
+            || self.mark_selection_box.is_some()
+            || self.manga_zoom_plus_held
+            || self.manga_zoom_minus_held
+            || self.manga_wheel_scroll_active
+            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.25
+            || self.manga_scroll_velocity.abs() > 0.25
+            || self.manga_video_seeking
+            || self.manga_video_volume_dragging
+            || self.gif_seeking
+            || masonry_scrollbar_moved_this_frame
+            || masonry_autoscroll_moved_this_frame
+            || masonry_scroll_animation_moved_this_frame
+            || wheel_steps != 0.0
+            || wheel_steps_ctrl != 0.0
+            || wheel_steps_shift != 0.0
+            || (ctrl_held
+                && (manga_ctrl_scroll_pan_bound || manga_ctrl_scroll_zoom_bound)
+                && (zoom_delta != 1.0 || wheel_steps_ctrl != 0.0));
+        let masonry_navigation_active_for_visible_retry =
+            self.mode().is_masonry() && strip_navigation_active_for_visible_retry;
 
         // Process decoded images from background threads and upload to GPU.
         // This is now non-blocking - images are decoded in parallel on background threads.
@@ -1003,11 +1022,17 @@ impl ImageViewer {
 
         // Re-evaluate hover target after scroll/zoom/pan updates so masonry hover-preview
         // tracks content motion even when the physical cursor did not move this frame.
+        // Skip hit-testing in Long Strip (hover preview isn't used there) and while dragging.
         if self.mode().is_masonry() {
             let masonry_hover_blocked = title_ui_blocking
                 || self.file_action_menu.is_some()
                 || self.any_modal_dialog_open();
-            if !masonry_hover_blocked {
+            let dragging_or_selecting = self.is_panning
+                || self.manga_scrollbar_dragging
+                || self.mark_selection_box.is_some();
+            if masonry_hover_blocked {
+                self.manga_hovered_media_index = None;
+            } else if !dragging_or_selecting {
                 let hover_candidate =
                     pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
                 if masonry_navigation_active_for_visible_retry {
@@ -1017,12 +1042,7 @@ impl ImageViewer {
                 } else {
                     self.manga_hovered_media_index = hover_candidate;
                 }
-            } else {
-                self.manga_hovered_media_index = None;
             }
-        } else if !title_ui_blocking && !pointer_over_shortcut_ui && !over_controls {
-            self.manga_hovered_media_index =
-                pointer_pos.and_then(|pos| self.manga_index_at_screen_pos(pos));
         } else {
             self.manga_hovered_media_index = None;
         }
@@ -1107,27 +1127,21 @@ impl ImageViewer {
                 .as_ref()
                 .is_some_and(|pending| self.manga_focused_video_index == Some(pending.index));
 
-        let masonry_visible_indices = if self.mode().is_masonry() && self.manga_use_rtree_backend()
-        {
-            Some(self.manga_collect_visible_indices())
-        } else {
-            None
-        };
-
-        let strip_visible_indices = if !self.mode().is_masonry() && self.manga_use_rtree_backend() {
-            Some(self.manga_collect_visible_indices())
-        } else {
-            None
-        };
+        let mut visible_indices_buf = std::mem::take(&mut self.manga_visible_indices_draw_scratch);
+        visible_indices_buf.clear();
+        let use_rtree_for_draw = self.manga_use_rtree_backend();
+        if use_rtree_for_draw {
+            self.manga_collect_visible_indices_into(&mut visible_indices_buf);
+        }
 
         // Long-strip fast-path: start drawing from the first visible index.
         // Masonry mode uses its own per-item visibility checks below.
-        let first_visible_idx = if self.mode().is_masonry() || strip_visible_indices.is_some() {
+        let first_visible_idx = if self.mode().is_masonry() || use_rtree_for_draw {
             0
         } else {
             self.manga_index_at_y(self.manga_scroll_offset.max(0.0))
         };
-        let first_visible_y = if self.mode().is_masonry() || strip_visible_indices.is_some() {
+        let first_visible_y = if self.mode().is_masonry() || use_rtree_for_draw {
             0.0
         } else {
             self.manga_page_start_y(first_visible_idx)
@@ -1144,9 +1158,9 @@ impl ImageViewer {
                     let viewport_bottom = viewport_top + screen_height;
                     let zoom = self.zoom.max(0.0001);
 
-                    if let Some(visible_indices) = masonry_visible_indices.as_ref() {
-                        for idx in visible_indices {
-                            let Some(item) = self.masonry_layout_items.get(*idx).copied() else {
+                    if use_rtree_for_draw {
+                        for &idx in &visible_indices_buf {
+                            let Some(item) = self.masonry_layout_items.get(idx).copied() else {
                                 continue;
                             };
 
@@ -1154,7 +1168,7 @@ impl ImageViewer {
                                 item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
                             if self.draw_manga_item(
                                 ui,
-                                *idx,
+                                idx,
                                 image_rect,
                                 masonry_navigation_active_for_visible_retry,
                             ) {
@@ -1169,6 +1183,7 @@ impl ImageViewer {
                             if item_top > viewport_bottom || item_bottom < viewport_top {
                                 continue;
                             }
+                            visible_indices_buf.push(idx);
 
                             let image_rect =
                                 item.to_screen_rect(zoom, self.offset.x, self.manga_scroll_offset);
@@ -1183,9 +1198,8 @@ impl ImageViewer {
                         }
                     }
                 } else {
-                    if let Some(visible_indices) = strip_visible_indices.as_ref() {
-                        for idx in visible_indices {
-                            let idx = *idx;
+                    if use_rtree_for_draw {
+                        for &idx in &visible_indices_buf {
                             let display_height = self.manga_page_height_cached(idx).max(1.0);
                             let y_offset = self.manga_page_start_y(idx) - self.manga_scroll_offset;
 
@@ -1205,7 +1219,7 @@ impl ImageViewer {
                                 ui,
                                 idx,
                                 image_rect,
-                                masonry_navigation_active_for_visible_retry,
+                                strip_navigation_active_for_visible_retry,
                             ) {
                                 requested_visible_retry = true;
                             }
@@ -1226,6 +1240,7 @@ impl ImageViewer {
                             if y_offset > screen_height {
                                 break;
                             }
+                            visible_indices_buf.push(idx);
 
                             // Get display dimensions first (uses manga_loader, not texture cache)
                             let display_height = img_height;
@@ -1241,7 +1256,7 @@ impl ImageViewer {
                                 ui,
                                 idx,
                                 image_rect,
-                                masonry_navigation_active_for_visible_retry,
+                                strip_navigation_active_for_visible_retry,
                             ) {
                                 requested_visible_retry = true;
                             }
@@ -1380,11 +1395,15 @@ impl ImageViewer {
         // Pump while work is in flight OR demand is outstanding. In-flight-only pumping is
         // edge-triggered: when dropped batches drain the counters to zero nothing repaints, so
         // tiles could only recover from pointer input (the hover force-retry path).
-        let demand_outstanding = self.manga_refresh_demand_outstanding(
-            masonry_visible_indices
-                .as_deref()
-                .or(strip_visible_indices.as_deref()),
+        let force_demand_recheck = has_pending_loads
+            || dims_updated
+            || requested_visible_retry
+            || self.manga_uploads_last_pass > 0;
+        let demand_outstanding = self.manga_refresh_demand_outstanding_with_hints(
+            Some(&visible_indices_buf),
+            force_demand_recheck,
         );
+        self.manga_visible_indices_draw_scratch = visible_indices_buf;
         let now = Instant::now();
         let demand_pump_due = demand_outstanding && now >= self.manga_demand_pump_at;
         if has_pending_loads || demand_pump_due {

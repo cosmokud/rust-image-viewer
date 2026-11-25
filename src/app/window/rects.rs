@@ -98,6 +98,7 @@ impl ImageViewer {
             Some(previous) if previous != origin => {
                 self.fullscreen_display_origin = Some(origin);
                 self.pending_display_refit = true;
+                self.refresh_display_refresh_hz(true);
             }
             _ => {}
         }

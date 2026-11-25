@@ -70,6 +70,8 @@ impl ImageViewer {
         self.masonry_layout_list_signature = 0;
         self.masonry_layout_valid = false;
         self.masonry_layout_invalidation_deferred = false;
+        self.manga_strip_deferred_dim_min_idx = None;
         self.masonry_pending_dimension_updates.clear();
+        self.manga_demand_last_visible.clear();
     }
 }

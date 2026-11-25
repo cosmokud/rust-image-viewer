@@ -147,6 +147,9 @@ impl ImageViewer {
     /// whose index no longer exists. Runs at `UNLOADABLE_STAMP_RECHECK` pace: one `stat` per
     /// marked file per interval, never per frame.
     pub(crate) fn manga_refresh_unloadable_media(&mut self) {
+        if self.manga_navigation_active_for_heavy_work() {
+            return;
+        }
         let now = Instant::now();
         if now < self.manga_unloadable_recheck_at + Self::UNLOADABLE_STAMP_RECHECK {
             return;
@@ -279,44 +282,50 @@ impl ImageViewer {
 
         // Out of retries on an image that still renders nothing: the file is broken, so give it
         // the X card. Videos are excluded: a video with no thumbnail is still playable.
-        let exhausted: Vec<usize> = visible
-            .iter()
-            .copied()
-            .filter(|&index| {
-                !self.manga_media_is_unloadable(index)
-                    && self
-                        .manga_loader
-                        .as_ref()
-                        .is_some_and(|loader| loader.retry_blocked(index))
-                    && self.image_list.get(index).is_some_and(|path| {
-                        crate::image_loader::is_supported_image(path)
-                            && !self
-                                .manga_texture_cache
-                                .contains_for_path(index, path.as_path())
-                    })
-            })
-            .collect();
-        for index in exhausted {
+        let mut exhausted = std::mem::take(&mut self.manga_repair_exhausted_scratch);
+        exhausted.clear();
+        for &index in visible {
+            if !self.manga_media_is_unloadable(index)
+                && self
+                    .manga_loader
+                    .as_ref()
+                    .is_some_and(|loader| loader.retry_blocked(index))
+                && self.image_list.get(index).is_some_and(|path| {
+                    crate::image_loader::is_supported_image(path)
+                        && !self
+                            .manga_texture_cache
+                            .contains_for_path(index, path.as_path())
+                })
+            {
+                exhausted.push(index);
+            }
+        }
+        for &index in &exhausted {
             self.manga_mark_media_unloadable(index);
         }
+        self.manga_repair_exhausted_scratch = exhausted;
 
-        let missing: Vec<usize> = visible
-            .iter()
-            .copied()
-            .filter(|&index| {
-                !self.manga_media_is_unloadable(index) && self.manga_visible_texture_missed(index)
-            })
-            .collect();
+        let mut missing = std::mem::take(&mut self.manga_repair_missing_scratch);
+        missing.clear();
+        for &index in visible {
+            if !self.manga_media_is_unloadable(index) && self.manga_visible_texture_missed(index) {
+                missing.push(index);
+            }
+        }
 
         // Prune timers for tiles that have a texture again or scrolled out of view.
-        self.manga_texture_missing_since
-            .retain(|index, _| missing.contains(index));
-        self.manga_texture_heal_budget
-            .retain(|index, (_, window_start)| {
-                missing.contains(index)
-                    && now.saturating_duration_since(*window_start)
-                        < Self::MANGA_TEXTURE_HEAL_WINDOW
-            });
+        if !self.manga_texture_missing_since.is_empty() {
+            self.manga_texture_missing_since
+                .retain(|index, _| missing.contains(index));
+        }
+        if !self.manga_texture_heal_budget.is_empty() {
+            self.manga_texture_heal_budget
+                .retain(|index, (_, window_start)| {
+                    missing.contains(index)
+                        && now.saturating_duration_since(*window_start)
+                            < Self::MANGA_TEXTURE_HEAL_WINDOW
+                });
+        }
 
         let mut still_missing = false;
         let mut repairs: Vec<usize> = Vec::new();
@@ -346,6 +355,7 @@ impl ImageViewer {
                 repairs.push(index);
             }
         }
+        self.manga_repair_missing_scratch = missing;
 
         for index in repairs {
             let claimed = self
@@ -465,9 +475,10 @@ impl ImageViewer {
         // Sample how many items are on screen now.
         // Long strip also derives a fractional viewport-coverage estimate from this set so
         // partial pages do not trigger oversized forward/backward probe windows.
-        let visible_page_count = self.manga_calculate_visible_page_count();
-        let visible_indices = self.manga_collect_visible_indices();
+        let mut visible_indices = std::mem::take(&mut self.manga_preload_visible_scratch);
+        self.manga_collect_visible_indices_into(&mut visible_indices);
         let visible_indices_count = visible_indices.len().max(1);
+        let visible_page_count = visible_indices_count;
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
         let is_masonry = self.mode().is_masonry();
@@ -508,13 +519,17 @@ impl ImageViewer {
             .max(Self::MANGA_CACHE_MIN_ENTRIES);
         let (downscale_filter, gif_filter) = self.manga_decode_filters_for_strip_mode();
         let force_triangle_filters = self.manga_should_force_triangle_filters();
-        let cached_indices = self.manga_texture_cache.cached_indices();
+        let mut cached_indices = std::mem::take(&mut self.manga_cached_indices_scratch);
+        self.manga_texture_cache
+            .cached_indices_into(&mut cached_indices);
         let layout = self.mode().layout();
-        let navigation_active = self.masonry_navigation_active_for_heavy_work();
+        let navigation_active = self.manga_navigation_active_for_heavy_work();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
 
         let plan = {
             let Some(loader) = self.manga_loader.as_mut() else {
+                self.manga_preload_visible_scratch = visible_indices;
+                self.manga_cached_indices_scratch = cached_indices;
                 return;
             };
 
@@ -540,10 +555,12 @@ impl ImageViewer {
                 cached_indices: &cached_indices,
             })
         };
+        self.manga_preload_visible_scratch = visible_indices;
+        self.manga_cached_indices_scratch = cached_indices;
 
         self.manga_cache_target_capacity = plan.cache_capacity;
         self.manga_texture_cache
-            .set_pinned_indices(plan.pinned_indices);
+            .set_pinned_indices_slice(&plan.pinned_indices);
         self.manga_texture_cache
             .set_max_entries(self.manga_cache_target_capacity);
         for idx in plan.evicted_indices {

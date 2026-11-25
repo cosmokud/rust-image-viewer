@@ -82,63 +82,63 @@ impl ImageViewer {
         self.manga_strip_spatial_index.as_ref()
     }
 
-    pub(crate) fn manga_query_visible_indices_rtree(
+    pub(crate) fn manga_query_visible_indices_rtree_into(
         &mut self,
         viewport_top: f32,
         viewport_bottom: f32,
-    ) -> Option<Vec<usize>> {
+        out: &mut Vec<usize>,
+    ) -> bool {
         if self.mode().is_masonry() {
             let zoom = self.zoom.max(0.0001);
             let min_y = viewport_top / zoom;
             let max_y = viewport_bottom / zoom;
-            return self
-                .manga_ensure_masonry_spatial_index()
-                .map(|index| index.query_vertical_band(min_y, max_y));
+            if let Some(index) = self.manga_ensure_masonry_spatial_index() {
+                index.query_vertical_band_into(min_y, max_y, out);
+                return true;
+            }
+            return false;
         }
 
-        self.manga_ensure_strip_spatial_index()
-            .map(|index| index.query_vertical_band(viewport_top, viewport_bottom))
+        if let Some(index) = self.manga_ensure_strip_spatial_index() {
+            index.query_vertical_band_into(viewport_top, viewport_bottom, out);
+            return true;
+        }
+        false
     }
 
-    pub(crate) fn manga_collect_visible_indices_linear(&mut self) -> Vec<usize> {
+    pub(crate) fn manga_collect_visible_indices_linear_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
         if self.mode().is_masonry() {
             self.masonry_ensure_layout_cache();
             if self.masonry_layout_items.is_empty() {
-                return Vec::new();
+                return;
             }
 
             let viewport_top = self.manga_scroll_offset.max(0.0);
             let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
             let zoom = self.zoom.max(0.0001);
 
-            return self
-                .masonry_layout_items
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, item)| {
-                    let item_top = item.y * zoom;
-                    let item_bottom = item_top + item.height * zoom;
-                    if item_top < viewport_bottom && item_bottom > viewport_top {
-                        Some(idx)
-                    } else {
-                        None
-                    }
-                })
-                .collect();
+            for (idx, item) in self.masonry_layout_items.iter().enumerate() {
+                let item_top = item.y * zoom;
+                let item_bottom = item_top + item.height * zoom;
+                if item_top < viewport_bottom && item_bottom > viewport_top {
+                    out.push(idx);
+                }
+            }
+            return;
         }
 
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
         let first_idx = self.manga_index_at_y(viewport_top);
 
-        let mut visible_indices = Vec::new();
         let mut y = self.manga_page_start_y(first_idx);
         for idx in first_idx..self.image_list.len() {
             let page_h = self.manga_page_height_cached(idx).max(1.0);
             let page_bottom = y + page_h;
 
             if y < viewport_bottom && page_bottom > viewport_top {
-                visible_indices.push(idx);
+                out.push(idx);
             }
 
             if y > viewport_bottom {
@@ -147,13 +147,12 @@ impl ImageViewer {
 
             y = page_bottom;
         }
-
-        visible_indices
     }
 
-    pub(crate) fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
+    pub(crate) fn manga_collect_visible_indices_into(&mut self, out: &mut Vec<usize>) {
+        out.clear();
         if self.mode().is_solo() || self.image_list.is_empty() {
-            return Vec::new();
+            return;
         }
 
         let query_started = Instant::now();
@@ -161,22 +160,25 @@ impl ImageViewer {
         let viewport_top = self.manga_scroll_offset.max(0.0);
         let viewport_bottom = viewport_top + self.screen_size.y.max(1.0);
 
-        if self.manga_use_rtree_backend() {
-            if let Some(indices) =
-                self.manga_query_visible_indices_rtree(viewport_top, viewport_bottom)
-            {
-                self.perf_metrics
-                    .record(Metric::MangaVisibleQueryMs, query_started.elapsed());
-                self.perf_metrics.count(Metric::MangaVisibleQueryRtree, 1);
-                return indices;
-            }
+        if self.manga_use_rtree_backend()
+            && self.manga_query_visible_indices_rtree_into(viewport_top, viewport_bottom, out)
+        {
+            self.perf_metrics
+                .record(Metric::MangaVisibleQueryMs, query_started.elapsed());
+            self.perf_metrics.count(Metric::MangaVisibleQueryRtree, 1);
+            return;
         }
 
-        let indices = self.manga_collect_visible_indices_linear();
+        self.manga_collect_visible_indices_linear_into(out);
         self.perf_metrics
             .record(Metric::MangaVisibleQueryMs, query_started.elapsed());
         self.perf_metrics.count(Metric::MangaVisibleQueryLinear, 1);
-        indices
+    }
+
+    pub(crate) fn manga_collect_visible_indices(&mut self) -> Vec<usize> {
+        let mut out = Vec::new();
+        self.manga_collect_visible_indices_into(&mut out);
+        out
     }
 
     pub(crate) fn manga_target_texture_side_for_preload(

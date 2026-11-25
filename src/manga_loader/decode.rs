@@ -100,7 +100,7 @@ impl MangaLoader {
             crate::diag::trace_file("decode-file", || {
                 let (width, height, rgba_bytes) = decoded
                     .as_ref()
-                    .map(|image| (image.width, image.height, image.pixels.len()))
+                    .map(|image| (image.width, image.height, image.pixel_bytes()))
                     .unwrap_or((0, 0, 0));
                 let declared = declared
                     .map(|(w, h)| format!("{}x{}", w, h))
@@ -156,10 +156,15 @@ impl MangaLoader {
                         );
                         let resize_time = resize_started.elapsed();
 
+                        let color_image = crate::texture_upload::rgba_vec_to_color_image(
+                            (width, height),
+                            pixels.into_owned(),
+                        );
+
                         Some(DecodedImage {
                             index: req.index,
                             path: req.path.clone(),
-                            pixels: pixels.into_owned(),
+                            color_image,
                             width,
                             height,
                             original_width: frame.original_width,
@@ -182,7 +187,7 @@ impl MangaLoader {
                         Some(DecodedImage {
                             index: req.index,
                             path: req.path.clone(),
-                            pixels: Vec::new(),
+                            color_image: egui::ColorImage::default(),
                             width: 0,
                             height: 0,
                             original_width,
@@ -256,12 +261,15 @@ impl MangaLoader {
                     downscale_filter,
                 );
                 let resize_time = resize_started.elapsed();
-                let pixels = pixels.into_owned();
+                let color_image = crate::texture_upload::rgba_vec_to_color_image(
+                    (width, height),
+                    pixels.into_owned(),
+                );
 
                 Some(DecodedImage {
                     index: req.index,
                     path: req.path.clone(),
-                    pixels,
+                    color_image,
                     width,
                     height,
                     original_width,
