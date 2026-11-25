@@ -74,6 +74,34 @@ impl ImageViewer {
         }
     }
 
+    /// Refresh-rate-scaled per-frame RGBA upload byte budget covering deferred GL upload + mipmaps.
+    pub(crate) fn manga_upload_byte_budget(&self, navigation_active: bool) -> usize {
+        let frame_budget_ms = self.current_frame_budget_ms();
+        let mib = 1024.0 * 1024.0;
+        if navigation_active {
+            (frame_budget_ms * 1.0 * mib)
+                .round()
+                .clamp(4.0 * mib, 14.0 * mib) as usize
+        } else {
+            (frame_budget_ms * 1.6 * mib)
+                .round()
+                .clamp(6.0 * mib, 24.0 * mib) as usize
+        }
+    }
+
+    /// Backs off GPU texture uploads for one cooldown frame when the previous VSync-paced frame
+    /// that uploaded textures exceeded 1.35x the display frame period (covering `SwapBuffers`).
+    pub(crate) fn manga_should_backoff_uploads(&self) -> bool {
+        if self.manga_uploads_last_pass == 0
+            || !self.manga_last_upload_vsync_paced
+            || !self.fps_last_dt_s.is_finite()
+            || self.fps_last_dt_s <= 0.0
+        {
+            return false;
+        }
+        (self.fps_last_dt_s * 1000.0) > self.current_frame_budget_ms() * 1.35
+    }
+
     pub(crate) fn manga_upload_p95_soft_hard_budgets_ms(&self) -> (f32, f32) {
         let frame_budget_ms = self.current_frame_budget_ms();
         let soft = (frame_budget_ms * 0.27).clamp(1.1, Self::MANGA_UPLOAD_P95_SOFT_BUDGET_MS);
@@ -186,6 +214,7 @@ impl ImageViewer {
         } else {
             visible_set.len().max(2)
         };
+        let texture_cache = &self.manga_texture_cache;
 
         self.manga_decoded_mailbox
             .make_contiguous()
@@ -196,6 +225,14 @@ impl ImageViewer {
                     anchor_index,
                     near_radius,
                 );
+                // Blank visible tiles must upload ahead of upgrades for tiles already on screen.
+                let upgrade_penalty = if navigation_active
+                    && texture_cache.contains_for_path(decoded.index, decoded.path.as_path())
+                {
+                    1u8
+                } else {
+                    0u8
+                };
                 let distance = decoded.index.abs_diff(anchor_index);
                 let media_penalty =
                     if navigation_active && decoded.media_type == MangaMediaType::Video {
@@ -209,7 +246,7 @@ impl ImageViewer {
                     0
                 };
 
-                (band, distance, media_penalty, lod_penalty)
+                (band, upgrade_penalty, distance, media_penalty, lod_penalty)
             });
 
         near_radius
@@ -275,16 +312,12 @@ impl ImageViewer {
             return near_radius;
         }
 
-        let dropped_count = (self.manga_decoded_mailbox.len() - keep) as u64;
+        let dropped_items: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(keep..).collect();
+        let dropped_count = dropped_items.len() as u64;
         if let Some(loader) = self.manga_loader.as_mut() {
-            loader.forget_indices(
-                self.manga_decoded_mailbox
-                    .drain(keep..)
-                    .map(|decoded| decoded.index),
-            );
-        } else {
-            self.manga_decoded_mailbox.truncate(keep);
+            loader.forget_indices(dropped_items.iter().map(|decoded| decoded.index));
         }
+        crate::manga_loader::drop_decoded_batch_off_thread(dropped_items);
 
         if dropped_count > 0 {
             self.perf_metrics

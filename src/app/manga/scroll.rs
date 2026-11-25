@@ -257,9 +257,13 @@ impl ImageViewer {
         self.manga_visible_indices_peak = 0;
         self.manga_pending_loads_peak = 0;
         self.manga_pending_decoded_peak = 0;
-        self.manga_decoded_mailbox.clear();
+        let dropped_mailbox: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(..).collect();
+        crate::manga_loader::drop_decoded_batch_off_thread(dropped_mailbox);
         self.last_manga_scroll_tick = None;
         self.manga_scroll_frame_dt_s = None;
+        self.last_manga_nav_active_at = None;
+        self.manga_deferred_mipmap_wake_at = None;
+        self.manga_last_upload_vsync_paced = false;
         self.manga_strip_deferred_dim_min_idx = None;
         self.manga_visible_mipmap_upgrade_pending = false;
         self.manga_demand_last_visible.clear();
@@ -277,6 +281,9 @@ impl ImageViewer {
         }
         if !preserve_dimensions {
             self.manga_dimension_cache_list_signature = 0;
+            self.strip_dim_warmup_complete = false;
+            self.strip_dim_warmup_list_signature = 0;
+            self.strip_dim_warmup_cursor = 0;
         }
 
         // Clear manga video players and textures

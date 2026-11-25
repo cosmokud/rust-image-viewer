@@ -71,6 +71,8 @@ impl ImageViewer {
         let prefer_visible_quality_during_autoscroll = self.manga_autoscroll_active;
         let defer_visible_quality =
             navigation_active_for_visible_retry && !prefer_visible_quality_during_autoscroll;
+        let nav_busy_or_debouncing = self.manga_navigation_active_for_heavy_work()
+            || self.manga_settle_debounce_remaining().is_some();
         let min_target_side = if is_masonry {
             Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE
         } else {
@@ -81,7 +83,7 @@ impl ImageViewer {
             && self.manga_strip_focused_video_playing()
             && Some(index) != self.manga_focused_video_index;
 
-        if quality_upgrade && defer_visible_quality {
+        if quality_upgrade && (defer_visible_quality || nav_busy_or_debouncing) {
             self.perf_metrics.count(Metric::MangaUpgradeDeferredNav, 1);
             return false;
         }
@@ -96,7 +98,7 @@ impl ImageViewer {
             .manga_clamp_target_side_to_source(index, display_target_side)
             .clamp(1, max_side);
         let masonry_fill_cap = if is_masonry {
-            if defer_visible_quality {
+            if defer_visible_quality || self.manga_navigation_active_for_heavy_work() {
                 self.masonry_navigation_target_side_cap()
             } else {
                 self.masonry_fill_target_side_cap()
@@ -111,17 +113,17 @@ impl ImageViewer {
             self.manga_target_texture_side.min(max_side)
         };
 
-        // During active masonry navigation, prioritize fast placeholder fill over texture quality.
-        let target_texture_side = if media_type == MangaMediaType::StaticImage {
-            desired_target_side.clamp(min_target_side, max_side)
-        } else if is_masonry && !quality_upgrade {
+        // During masonry fill (and active masonry navigation), keep initial visible tiles
+        // bounded by the grid density/navigation cap (even for `StaticImage`) instead of
+        // jumping straight to full 24 MP targets mid-scroll.
+        let target_texture_side = if is_masonry && !quality_upgrade {
             let fill_cap = masonry_fill_cap
                 .min(self.manga_target_texture_side.max(min_target_side))
                 .max(min_target_side);
             let side = desired_target_side.min(fill_cap).max(min_target_side);
             if side < desired_target_side {
                 self.perf_metrics.count(
-                    if defer_visible_quality {
+                    if defer_visible_quality || self.manga_navigation_active_for_heavy_work() {
                         Metric::MangaRetryLowLodNav
                     } else {
                         Metric::MangaRetryLowLodFill
@@ -130,6 +132,11 @@ impl ImageViewer {
                 );
             }
             side
+        } else if !is_masonry {
+            let strip_cap = self.manga_strip_lod_side_cap();
+            desired_target_side
+                .max(preload_floor_side)
+                .clamp(min_target_side.min(strip_cap), strip_cap)
         } else {
             desired_target_side
                 .max(preload_floor_side)

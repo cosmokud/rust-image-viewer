@@ -195,37 +195,55 @@ impl ImageViewer {
         if self.mode().is_masonry() {
             self.masonry_ensure_layout_cache();
             let zoom = self.zoom.max(0.0001);
-            let mut visible_max_side = 0.0f32;
+            let viewport_cap =
+                (self.screen_size.x.max(self.screen_size.y).max(1.0) * 1.25 * self.zoom.max(1.0))
+                    .max(Self::MANGA_MASONRY_DYNAMIC_TARGET_MIN_SIDE as f32);
+            let mut sample_sides = [0.0f32; 96];
+            let mut sample_count = 0usize;
 
-            for &idx in visible_indices.iter().take(96) {
+            for &idx in visible_indices.iter().take(sample_sides.len()) {
                 if let Some(item) = self.masonry_layout_items.get(idx) {
                     let slot_size = egui::vec2(item.width * zoom, item.height * zoom);
                     let display_size = self.masonry_item_display_size(idx, slot_size);
-                    visible_max_side = visible_max_side.max(display_size.x.max(display_size.y));
+                    sample_sides[sample_count] =
+                        display_size.x.max(display_size.y).min(viewport_cap);
+                    sample_count += 1;
                 }
             }
 
+            let representative_side = if sample_count > 0 {
+                let slice = &mut sample_sides[..sample_count];
+                slice.sort_unstable_by(|a, b| a.total_cmp(b));
+                slice[(sample_count.saturating_sub(1) * 3) / 4]
+            } else {
+                1.0
+            };
+
             let mut target_side =
-                self.masonry_target_texture_side_from_display_side(visible_max_side.max(1.0));
+                self.masonry_target_texture_side_from_display_side(representative_side.max(1.0));
             if self.masonry_navigation_active_for_heavy_work() {
                 target_side = target_side.min(self.masonry_navigation_target_side_cap());
             }
             return target_side;
         }
 
+        let viewport_cap =
+            (self.screen_size.x.max(self.screen_size.y).max(1.0) * self.zoom.max(1.0) * 1.25)
+                .max(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE as f32);
         let mut visible_max_side = 0.0f32;
         for &idx in visible_indices.iter().take(6) {
             let display_w = self.manga_get_image_display_width(idx);
             let display_h = self.manga_get_image_display_height(idx);
-            visible_max_side = visible_max_side.max(display_w.max(display_h));
+            visible_max_side = visible_max_side.max(display_w.max(display_h).min(viewport_cap));
         }
 
         if visible_max_side <= 0.0 && anchor_index < self.image_list.len() {
             let display_w = self.manga_get_image_display_width(anchor_index);
             let display_h = self.manga_get_image_display_height(anchor_index);
-            visible_max_side = display_w.max(display_h);
+            visible_max_side = display_w.max(display_h).min(viewport_cap);
         }
 
         self.manga_strip_target_texture_side_from_display_side(visible_max_side.max(1.0))
+            .min(self.manga_strip_lod_side_cap())
     }
 }

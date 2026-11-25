@@ -136,6 +136,6 @@ impl ImageViewer {
     }
 
     pub(crate) fn manga_should_force_triangle_filters(&self) -> bool {
-        self.mode().is_masonry()
+        self.mode().is_masonry() || self.manga_navigation_active_for_heavy_work()
     }
 }

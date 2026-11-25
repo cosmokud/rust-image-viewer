@@ -39,6 +39,42 @@ impl ImageViewer {
         self.manga_navigation_active_for_heavy_work()
     }
 
+    pub(crate) fn manga_note_navigation_state(&mut self) {
+        if self.manga_navigation_active_for_heavy_work() {
+            self.last_manga_nav_active_at = Some(Instant::now());
+            self.manga_deferred_mipmap_wake_at = None;
+        }
+    }
+
+    pub(crate) fn manga_settle_debounce_remaining(&self) -> Option<Duration> {
+        let debounce = Duration::from_millis(Self::MANGA_SETTLE_DEBOUNCE_MS);
+        if self.manga_navigation_active_for_heavy_work() {
+            return Some(debounce);
+        }
+        let last = self.last_manga_nav_active_at?;
+        let elapsed = last.elapsed();
+        (elapsed < debounce).then(|| debounce.saturating_sub(elapsed))
+    }
+
+    pub(crate) fn manga_settle_upgrade_wake(&self) -> Option<Duration> {
+        if !self.mode().is_manga() {
+            return None;
+        }
+        let now = Instant::now();
+        let masonry_wake = self
+            .masonry_quality_refine_due_at
+            .map(|due| due.saturating_duration_since(now));
+        let mipmap_wake = self
+            .manga_deferred_mipmap_wake_at
+            .map(|due| due.saturating_duration_since(now));
+        match (masonry_wake, mipmap_wake) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) => Some(a),
+            (None, Some(b)) => Some(b),
+            (None, None) => None,
+        }
+    }
+
     pub(crate) fn draw_fps_overlay(&self, ctx: &egui::Context) {
         if !self.config.show_fps {
             return;

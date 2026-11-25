@@ -316,12 +316,19 @@ impl ImageViewer {
         crate::diag::note_stage("mailbox_prune");
         let _near_radius =
             self.manga_prune_decoded_mailbox(&visible_set, upload_anchor_index, navigation_active);
-        // During active scrolling, only upload currently visible (band 0) items; leave offscreen
-        // prefetch items queued in `manga_decoded_mailbox` to upload smoothly once scroll settles.
-        let eligible_uploads = if navigation_active {
+        // During active scrolling, only upload blank currently visible (band 0) items; leave
+        // offscreen prefetch items and upgrades for already-cached textures queued in the mailbox.
+        let eligible_uploads = if self.manga_should_backoff_uploads() {
+            0
+        } else if navigation_active {
             self.manga_decoded_mailbox
                 .iter()
-                .take_while(|decoded| visible_set.contains(&decoded.index))
+                .take_while(|decoded| {
+                    visible_set.contains(&decoded.index)
+                        && !self
+                            .manga_texture_cache
+                            .contains_for_path(decoded.index, decoded.path.as_path())
+                })
                 .count()
         } else {
             self.manga_decoded_mailbox.len()
@@ -332,48 +339,109 @@ impl ImageViewer {
         let upload_count = upload_batch_limit.min(eligible_uploads);
 
         crate::diag::note_stage("cache_evict");
-        let mut evicted_to_mark_unloaded = self
-            .manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
+        let vram_budget = if navigation_active {
+            crate::manga_loader::MANGA_CACHE_BUDGET_BYTES_NAV
+        } else {
+            crate::manga_loader::MANGA_CACHE_BUDGET_BYTES_IDLE
+        };
+        let mut evicted_to_mark_unloaded = self.manga_texture_cache.set_limits_and_maybe_evict(
+            self.manga_cache_target_capacity,
+            vram_budget,
+            navigation_active,
+        );
+        let byte_budget = self.manga_upload_byte_budget(navigation_active);
         let mut uploaded_textures = 0u64;
         let mut processed_items = 0usize;
+        let mut queued_upload_bytes = 0usize;
+        let mut had_large_upload = false;
+        let mut large_mipmapped_uploads_this_pass = 0usize;
         let mut mipmap_only_upgrades_this_pass = 0usize;
         let upload_loop_start = Instant::now();
         let inline_upload_budget =
             Duration::from_secs_f32(self.manga_inline_upload_budget_ms(navigation_active) / 1000.0);
 
-        // Upload decoded images to GPU as textures within a strict refresh-rate-aware time budget.
+        // Upload decoded images to GPU as textures within strict time + RGBA byte budgets.
         while processed_items < upload_count {
-            if uploaded_textures > 0 && upload_loop_start.elapsed() >= inline_upload_budget {
+            if uploaded_textures > 0
+                && (queued_upload_bytes >= byte_budget
+                    || upload_loop_start.elapsed() >= inline_upload_budget)
+            {
                 break;
             }
-            if mipmap_only_upgrades_this_pass >= 1 {
-                let front_is_mipmap_only =
-                    self.manga_decoded_mailbox.front().is_some_and(|front| {
-                        self.image_list
-                            .get(front.index)
-                            .is_some_and(|path| path == &front.path)
-                            && self
-                                .manga_texture_cache
-                                .peek_texture_mipmap_info_for_path(
-                                    front.index,
-                                    front.path.as_path(),
-                                )
-                                .is_some_and(|(existing_w, existing_h, _, mipmap_deferred)| {
-                                    mipmap_deferred
-                                        && !self.manga_texture_upgrade_needed(
-                                            existing_w,
-                                            existing_h,
-                                            front.width,
-                                            front.height,
-                                            front.media_type,
-                                        )
-                                })
+
+            let Some((
+                front_idx,
+                front_bytes,
+                front_media_type,
+                front_dims,
+                front_matches_list,
+                front_is_mipmap_only,
+                front_cached_info,
+            )) = self.manga_decoded_mailbox.front().map(|front| {
+                let matches_list = self
+                    .image_list
+                    .get(front.index)
+                    .is_some_and(|path| path == &front.path);
+                let cached_info = self
+                    .manga_texture_cache
+                    .peek_texture_mipmap_info_for_path(front.index, front.path.as_path());
+                let is_mipmap_only = matches_list
+                    && cached_info.is_some_and(|(existing_w, existing_h, _, mipmap_deferred)| {
+                        mipmap_deferred
+                            && !self.manga_texture_upgrade_needed(
+                                existing_w,
+                                existing_h,
+                                front.width,
+                                front.height,
+                                front.media_type,
+                            )
                     });
-                if front_is_mipmap_only {
+                (
+                    front.index,
+                    front.pixel_bytes(),
+                    front.media_type,
+                    (front.width, front.height),
+                    matches_list,
+                    is_mipmap_only,
+                    cached_info,
+                )
+            })
+            else {
+                break;
+            };
+
+            if uploaded_textures > 0 {
+                if navigation_active
+                    && (had_large_upload || front_bytes > Self::MANGA_LARGE_TEXTURE_BYTES)
+                {
+                    break;
+                }
+                if !navigation_active
+                    && queued_upload_bytes.saturating_add(front_bytes) > byte_budget
+                {
+                    break;
+                }
+                if mipmap_only_upgrades_this_pass >= 1 && front_is_mipmap_only {
+                    break;
+                }
+                if !navigation_active
+                    && large_mipmapped_uploads_this_pass >= 1
+                    && front_bytes > Self::MANGA_LARGE_TEXTURE_BYTES
+                    && front_matches_list
+                    && self
+                        .manga_upload_policy_with_nav(
+                            front_idx,
+                            front_media_type,
+                            front_dims,
+                            false,
+                        )
+                        .mipmap_enabled(front_dims)
+                {
                     break;
                 }
             }
+            let _ = front_cached_info;
+
             let Some(decoded) = self.manga_decoded_mailbox.pop_front() else {
                 break;
             };
@@ -387,6 +455,7 @@ impl ImageViewer {
                 if let Some(loader) = self.manga_loader.as_mut() {
                     loader.reset_index_state_for(decoded.index);
                 }
+                crate::manga_loader::drop_color_image_off_thread(decoded.color_image);
                 continue;
             }
 
@@ -394,6 +463,7 @@ impl ImageViewer {
             // that was queued before the diagnosis instead of uploading it to a tile showing
             // the X card.
             if self.manga_media_is_unloadable(decoded.index) {
+                crate::manga_loader::drop_color_image_off_thread(decoded.color_image);
                 continue;
             }
 
@@ -430,6 +500,7 @@ impl ImageViewer {
                     );
                 if !dim_upgrade && !mipmap_upgrade {
                     self.manga_ttv_pending.remove(&decoded.index);
+                    crate::manga_loader::drop_color_image_off_thread(decoded.color_image);
                     continue;
                 }
                 is_mipmap_only_upgrade = mipmap_upgrade;
@@ -506,6 +577,7 @@ impl ImageViewer {
                         .clear_mipmap_deferred_for_path(decoded.index, decoded.path.as_path());
                 }
                 self.manga_ttv_pending.remove(&decoded.index);
+                crate::manga_loader::drop_color_image_off_thread(decoded.color_image);
                 continue;
             }
 
@@ -551,11 +623,11 @@ impl ImageViewer {
                 });
             }
 
-            // Insert into cache with media type (this may evict old entries)
+            // Insert into cache with media type (this may evict old entries, deferred mid-scroll)
             crate::diag::note_stage("cache_insert");
             let evicted = self
                 .manga_texture_cache
-                .insert_with_type_with_mipmap_deferred(
+                .insert_with_type_and_eviction_policy(
                     decoded.index,
                     decoded.path.clone(),
                     texture,
@@ -563,8 +635,17 @@ impl ImageViewer {
                     decoded.height,
                     decoded.media_type,
                     mipmap_deferred,
+                    navigation_active,
                 );
             uploaded_textures = uploaded_textures.saturating_add(1);
+            queued_upload_bytes = queued_upload_bytes.saturating_add(decoded_pixel_bytes);
+            if decoded_pixel_bytes > Self::MANGA_LARGE_TEXTURE_BYTES {
+                had_large_upload = true;
+                if uploaded.mipmap_enabled {
+                    large_mipmapped_uploads_this_pass =
+                        large_mipmapped_uploads_this_pass.saturating_add(1);
+                }
+            }
             if is_mipmap_only_upgrade {
                 mipmap_only_upgrades_this_pass = mipmap_only_upgrades_this_pass.saturating_add(1);
             }
@@ -580,7 +661,9 @@ impl ImageViewer {
 
             evicted_to_mark_unloaded.extend(evicted);
 
-            if upload_loop_start.elapsed() >= inline_upload_budget {
+            if queued_upload_bytes >= byte_budget
+                || upload_loop_start.elapsed() >= inline_upload_budget
+            {
                 break;
             }
         }

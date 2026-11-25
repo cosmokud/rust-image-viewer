@@ -409,7 +409,8 @@ impl ImageViewer {
 
     pub(crate) fn clear_manga_runtime_workloads(&mut self) {
         self.clear_pending_manga_video_load();
-        self.manga_decoded_mailbox.clear();
+        let dropped_mailbox: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(..).collect();
+        crate::manga_loader::drop_decoded_batch_off_thread(dropped_mailbox);
         self.clear_manga_video_players();
         self.manga_video_failed.clear();
         self.manga_focused_video_index = None;
@@ -418,5 +419,76 @@ impl ImageViewer {
         self.manga_anim_streams.clear();
         self.manga_anim_stream_done.clear();
         self.manga_focused_anim_index = None;
+    }
+
+    /// Non-blocking Long Strip dimension pre-probing: slowly sweeps missing supported media
+    /// dimensions across the folder in idle periods so diverse aspect ratios settle early
+    /// without stalling scroll or showing a modal overlay.
+    pub(crate) fn tick_strip_background_dimension_warmup(&mut self) {
+        if self.mode().is_solo() || self.mode().is_masonry() || self.image_list.is_empty() {
+            return;
+        }
+        if self.manga_navigation_active_for_heavy_work() || self.manga_strip_focused_video_playing()
+        {
+            return;
+        }
+
+        let total = self.image_list.len();
+        if self.strip_dim_warmup_list_signature != self.image_list_signature {
+            self.strip_dim_warmup_list_signature = self.image_list_signature;
+            self.strip_dim_warmup_complete = false;
+            self.strip_dim_warmup_cursor = self.current_index.min(total.saturating_sub(1));
+        }
+
+        if self.strip_dim_warmup_complete {
+            return;
+        }
+
+        let now = Instant::now();
+        if now.saturating_duration_since(self.strip_dim_warmup_last_tick_at)
+            < Duration::from_millis(60)
+        {
+            return;
+        }
+        self.strip_dim_warmup_last_tick_at = now;
+
+        let cursor = self.strip_dim_warmup_cursor.min(total.saturating_sub(1));
+        const STRIP_DIM_WARMUP_BATCH: usize = 32;
+        let end = (cursor + STRIP_DIM_WARMUP_BATCH).min(total);
+        let probes_busy = {
+            let Some(loader) = self.manga_loader.as_mut() else {
+                return;
+            };
+            let backlog = loader.backlog();
+            if backlog.dimension_probes >= 32 || backlog.dimension_results >= 8 {
+                true
+            } else {
+                loader.warm_dimensions_background(&self.image_list, cursor, end, 0);
+                false
+            }
+        };
+        if probes_busy {
+            return;
+        }
+
+        let next_cursor = if end >= total { 0 } else { end };
+        self.strip_dim_warmup_cursor = next_cursor;
+
+        if next_cursor == 0 {
+            let any_missing = self.manga_loader.as_ref().is_some_and(|loader| {
+                let backlog = loader.backlog();
+                backlog.dimension_probes > 0
+                    || backlog.dimension_results > 0
+                    || self.image_list.iter().enumerate().any(|(idx, path)| {
+                        !self.is_folder_navigation_entry_path(path.as_path())
+                            && (crate::image_loader::is_supported_image(path.as_path())
+                                || is_supported_video(path.as_path()))
+                            && loader.get_dimensions(idx).is_none()
+                    })
+            });
+            if !any_missing {
+                self.strip_dim_warmup_complete = true;
+            }
+        }
     }
 }

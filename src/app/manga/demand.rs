@@ -522,6 +522,10 @@ impl ImageViewer {
         let mut cached_indices = std::mem::take(&mut self.manga_cached_indices_scratch);
         self.manga_texture_cache
             .cached_indices_into(&mut cached_indices);
+        let mut cached_entry_bytes = std::mem::take(&mut self.manga_cached_entry_bytes_scratch);
+        self.manga_texture_cache
+            .cached_entries_bytes_into(&mut cached_entry_bytes);
+        let cached_resident_bytes = self.manga_texture_cache.resident_bytes();
         let layout = self.mode().layout();
         let navigation_active = self.manga_navigation_active_for_heavy_work();
         let masonry_rows = self.masonry_items_per_row.clamp(2, 10);
@@ -530,6 +534,7 @@ impl ImageViewer {
             let Some(loader) = self.manga_loader.as_mut() else {
                 self.manga_preload_visible_scratch = visible_indices;
                 self.manga_cached_indices_scratch = cached_indices;
+                self.manga_cached_entry_bytes_scratch = cached_entry_bytes;
                 return;
             };
 
@@ -553,18 +558,29 @@ impl ImageViewer {
                 preserve_recent_cache,
                 previous_cache_capacity,
                 cached_indices: &cached_indices,
+                cached_resident_bytes,
+                cached_entry_bytes: &cached_entry_bytes,
             })
         };
         self.manga_preload_visible_scratch = visible_indices;
         self.manga_cached_indices_scratch = cached_indices;
+        self.manga_cached_entry_bytes_scratch = cached_entry_bytes;
 
         self.manga_cache_target_capacity = plan.cache_capacity;
         self.manga_texture_cache
             .set_pinned_indices_slice(&plan.pinned_indices);
-        self.manga_texture_cache
-            .set_max_entries(self.manga_cache_target_capacity);
-        for idx in plan.evicted_indices {
-            self.manga_texture_cache.remove(idx);
+        let cache_evicted = self.manga_texture_cache.set_limits_and_maybe_evict(
+            self.manga_cache_target_capacity,
+            plan.vram_budget_bytes,
+            navigation_active,
+        );
+        for idx in &plan.evicted_indices {
+            self.manga_texture_cache.remove(*idx);
+        }
+        if !cache_evicted.is_empty() {
+            if let Some(loader) = self.manga_loader.as_mut() {
+                loader.forget_indices(cache_evicted);
+            }
         }
 
         // Now that layout is stabilized, update the last scroll position.

@@ -30,11 +30,15 @@ impl ImageViewer {
                 navigation_active && !self.manga_autoscroll_active,
             )
         } else {
+            let strip_cap = self.manga_strip_lod_side_cap();
             ((image_rect.width().max(image_rect.height())
                 * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
                 * target_scale)
                 .ceil() as u32)
-                .clamp(Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(max_side), max_side)
+                .clamp(
+                    Self::MANGA_DYNAMIC_TARGET_MIN_SIDE.min(strip_cap),
+                    strip_cap,
+                )
         };
 
         self.manga_clamp_target_side_to_source(index, target_side)
@@ -65,9 +69,12 @@ impl ImageViewer {
 
         if self.mode().is_masonry() {
             if media_type == MangaMediaType::StaticImage {
-                return desired_width > existing_width
-                    || desired_height > existing_height
-                    || desired_pixels > existing_pixels;
+                // Avoid re-decoding 24 MP tiles on trivial sub-pixel/DPI deltas: require >=15%
+                // side growth or >=96px delta before triggering a quality upgrade.
+                let side_growth = desired_side.saturating_sub(existing_side);
+                let meaningful_growth = (desired_side as f32 >= existing_side as f32 * 1.15)
+                    || side_growth >= Self::MANGA_TEXTURE_UPGRADE_MASONRY_MIN_DELTA_SIDE;
+                return desired_pixels > existing_pixels && meaningful_growth;
             }
 
             if media_type == MangaMediaType::Video {
@@ -130,17 +137,20 @@ impl ImageViewer {
     }
 
     /// Upgrades settled visible textures whose mipmaps were suppressed mid-scroll.
-    /// Bounded to at most one deferred-mipmap upgrade in flight or queued per frame.
+    /// Waits out the post-scroll settle debounce before starting re-decodes and is bounded
+    /// to at most one deferred-mipmap upgrade in flight or queued per frame.
     /// Returns `(queued_retry_this_frame, any_visible_upgrade_pending)`.
     pub(crate) fn manga_tick_deferred_mipmap_upgrades(
         &mut self,
         visible: &[usize],
     ) -> (bool, bool) {
         if !self.mode().is_manga() || self.mode().is_solo() || self.image_list.is_empty() {
+            self.manga_deferred_mipmap_wake_at = None;
             return (false, false);
         }
         if self.manga_navigation_active_for_heavy_work() || self.manga_strip_focused_video_playing()
         {
+            self.manga_deferred_mipmap_wake_at = None;
             return (false, false);
         }
         if self.mode().is_masonry()
@@ -149,14 +159,17 @@ impl ImageViewer {
                 || self.masonry_quality_refine_frames_remaining > 0
                 || self.masonry_metadata_preload_active)
         {
+            self.manga_deferred_mipmap_wake_at = None;
             return (false, false);
         }
 
+        let settle_remaining = self.manga_settle_debounce_remaining();
         let now = Instant::now();
         let max_side = self.max_texture_side.max(1);
         let mut queued_retry = false;
         let mut in_progress = false;
         let mut still_pending = false;
+        let mut debounce_waiting = false;
 
         for &idx in visible {
             let Some(path) = self.image_list.get(idx).cloned() else {
@@ -192,6 +205,11 @@ impl ImageViewer {
             if !settled_policy.mipmap_enabled((tex_w, tex_h)) {
                 self.manga_texture_cache
                     .clear_mipmap_deferred_for_path(idx, path.as_path());
+                continue;
+            }
+
+            if settle_remaining.is_some() {
+                debounce_waiting = true;
                 continue;
             }
 
@@ -278,6 +296,11 @@ impl ImageViewer {
                 still_pending = true;
             }
         }
+
+        self.manga_deferred_mipmap_wake_at = match (debounce_waiting, settle_remaining) {
+            (true, Some(remaining)) => Some(now + remaining),
+            _ => None,
+        };
 
         (queued_retry, still_pending)
     }

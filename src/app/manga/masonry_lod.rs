@@ -403,6 +403,12 @@ impl ImageViewer {
 
         let fill_side = self.manga_bucket_side_nearest_pixels_for_rect(index, image_rect, 0.25);
         let final_side = self.manga_bucket_side_covering_rect(index, image_rect);
-        (fill_side.min(final_side), final_side.max(fill_side))
+        let (fill_side, final_side) = (fill_side.min(final_side), final_side.max(fill_side));
+        if self.mode().is_masonry() {
+            (fill_side, final_side)
+        } else {
+            let cap = self.manga_strip_lod_side_cap();
+            (fill_side.min(cap), final_side.min(cap))
+        }
     }
 }

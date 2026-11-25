@@ -761,6 +761,19 @@ pub(crate) struct ImageViewer {
     pub(crate) manga_repair_missing_scratch: Vec<usize>,
     pub(crate) manga_preload_visible_scratch: Vec<usize>,
     pub(crate) manga_cached_indices_scratch: Vec<usize>,
+    pub(crate) manga_cached_entry_bytes_scratch: Vec<(usize, usize)>,
+    /// True when the previous frame's update ran under VSync immediate pacing (used for upload
+    /// SwapBuffers stall backoff without falsely counting 16ms/66ms intentional sleep timers).
+    pub(crate) manga_last_upload_vsync_paced: bool,
+    /// Last timestamp when vertical-scroll / pan / zoom navigation was active.
+    pub(crate) last_manga_nav_active_at: Option<Instant>,
+    /// Earliest instant when post-scroll deferred mipmap upgrades can begin after settle debounce.
+    pub(crate) manga_deferred_mipmap_wake_at: Option<Instant>,
+    /// Non-blocking Long Strip dimension pre-probing state across the folder.
+    pub(crate) strip_dim_warmup_cursor: usize,
+    pub(crate) strip_dim_warmup_list_signature: u64,
+    pub(crate) strip_dim_warmup_complete: bool,
+    pub(crate) strip_dim_warmup_last_tick_at: Instant,
     /// Cached visible set & inputs for skipping redundant `demand_outstanding` lock churn.
     pub(crate) manga_demand_last_visible: Vec<usize>,
     pub(crate) manga_demand_last_target_side: u32,
@@ -1360,6 +1373,14 @@ impl Default for ImageViewer {
             manga_repair_missing_scratch: Vec::new(),
             manga_preload_visible_scratch: Vec::new(),
             manga_cached_indices_scratch: Vec::new(),
+            manga_cached_entry_bytes_scratch: Vec::new(),
+            manga_last_upload_vsync_paced: false,
+            last_manga_nav_active_at: None,
+            manga_deferred_mipmap_wake_at: None,
+            strip_dim_warmup_cursor: 0,
+            strip_dim_warmup_list_signature: 0,
+            strip_dim_warmup_complete: false,
+            strip_dim_warmup_last_tick_at: Instant::now(),
             manga_demand_last_visible: Vec::new(),
             manga_demand_last_target_side: 0,
             manga_demand_last_list_signature: 0,
@@ -1528,6 +1549,8 @@ impl ImageViewer {
 
     pub(crate) const MANGA_UPLOAD_P95_HARD_BUDGET_MS: f32 = 7.5;
 
+    pub(crate) const MANGA_LARGE_TEXTURE_BYTES: usize = 2 * 1024 * 1024;
+
     pub(crate) const MANGA_VIRTUALIZATION_AUTO_RTREE_MIN_ITEMS: usize = 2048;
 
     pub(crate) const MANGA_CACHE_MIN_ENTRIES: usize = 64;
@@ -1564,7 +1587,9 @@ impl ImageViewer {
 
     pub(crate) const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
 
-    pub(crate) const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = 45;
+    pub(crate) const MANGA_SETTLE_DEBOUNCE_MS: u64 = 350;
+
+    pub(crate) const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = Self::MANGA_SETTLE_DEBOUNCE_MS;
 
     pub(crate) const MASONRY_QUALITY_REFINE_MAX_FRAMES: u8 = 12;
 

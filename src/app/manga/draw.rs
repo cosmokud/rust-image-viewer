@@ -44,6 +44,8 @@ impl ImageViewer {
 
         if self.mode().is_masonry() && self.masonry_metadata_preload_active {
             self.tick_masonry_metadata_preload();
+        } else if !self.mode().is_masonry() {
+            self.tick_strip_background_dimension_warmup();
         }
 
         let screen_rect = ctx.screen_rect();
@@ -946,6 +948,7 @@ impl ImageViewer {
         {
             self.manga_flush_deferred_strip_dims_if_needed();
         }
+        self.manga_note_navigation_state();
 
         let strip_navigation_active_for_visible_retry = self.is_panning
             || self.mark_selection_box.is_some()
@@ -1040,7 +1043,8 @@ impl ImageViewer {
         }
 
         if self.mode().is_masonry() {
-            let navigation_active = masonry_navigation_active_for_visible_retry;
+            let navigation_active = masonry_navigation_active_for_visible_retry
+                || self.manga_navigation_active_for_heavy_work();
 
             if navigation_active {
                 // Keep hover autoplay immediate in masonry so scroll-driven hover updates
@@ -1056,9 +1060,7 @@ impl ImageViewer {
                     ctx.request_repaint_after(Duration::from_millis(
                         Self::MASONRY_QUALITY_REFINE_SETTLE_MS,
                     ));
-                } else if self.masonry_begin_quality_refine_if_due(
-                    masonry_navigation_active_for_visible_retry,
-                ) {
+                } else if self.masonry_begin_quality_refine_if_due(navigation_active) {
                     self.manga_preload_cooldown = 0;
                     self.manga_update_preload_queue();
                     animation_active = true;

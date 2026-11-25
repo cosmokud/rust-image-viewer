@@ -710,6 +710,7 @@ impl eframe::App for ImageViewer {
             .unwrap_or((0, 0, 0, 0));
         if skip_drawing || !self.mode().is_manga() {
             self.manga_visible_mipmap_upgrade_pending = false;
+            self.manga_deferred_mipmap_wake_at = None;
         }
         let masonry_metadata_preload_running = self.mode().is_manga()
             && self.mode().is_masonry()
@@ -818,6 +819,7 @@ impl eframe::App for ImageViewer {
             || manga_background_work_pending
             || manga_video_playing
             || video_playing;
+        self.manga_last_upload_vsync_paced = any_animation_active || manga_upload_catchup_pending;
 
         // Update idle state and optimize repaint scheduling
         if any_animation_active {
@@ -959,6 +961,10 @@ impl eframe::App for ImageViewer {
                 }
                 // Same for a spent video thumbnail: wake at its revive window, not every pump.
                 if let Some(wake) = self.manga_video_revive_wake() {
+                    schedule_min(wake);
+                }
+                // Wake once at settle-debounce expiry so deferred mipmap/quality upgrades run cleanly.
+                if let Some(wake) = self.manga_settle_upgrade_wake() {
                     schedule_min(wake);
                 }
             }

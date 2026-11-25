@@ -35,7 +35,11 @@ impl ImageViewer {
         &mut self,
         navigation_active_for_quality_work: bool,
     ) -> bool {
-        if !self.mode().is_masonry() || self.mode().is_solo() || navigation_active_for_quality_work
+        if !self.mode().is_masonry()
+            || self.mode().is_solo()
+            || navigation_active_for_quality_work
+            || self.manga_navigation_active_for_heavy_work()
+            || self.manga_settle_debounce_remaining().is_some()
         {
             return false;
         }
@@ -93,11 +97,31 @@ impl ImageViewer {
         )
     }
 
+    /// Long Strip texture side ceiling: caps unzoomed textures to <= 2560 (or <= 2048 mid-scroll),
+    /// reserving > 4096 decodes strictly for zoomed-in settled views. Never constrains Solo mode.
+    pub(crate) fn manga_strip_lod_side_cap(&self) -> u32 {
+        let max_side = self.max_texture_side.max(1);
+        if self.mode().is_solo() || self.mode().is_masonry() {
+            return max_side;
+        }
+        if self.zoom <= 1.15 {
+            if self.manga_navigation_active_for_heavy_work() {
+                2048.min(max_side)
+            } else {
+                2560.min(max_side)
+            }
+        } else if self.manga_navigation_active_for_heavy_work() {
+            4096.min(max_side)
+        } else {
+            max_side
+        }
+    }
+
     pub(crate) fn manga_strip_target_texture_side_from_display_side(
         &self,
         item_screen_max_side: f32,
     ) -> u32 {
-        let max_side = self.max_texture_side.max(1);
+        let max_side = self.manga_strip_lod_side_cap();
         let scaled = (item_screen_max_side.max(1.0)
             * Self::MANGA_DYNAMIC_TARGET_OVERSCAN
             * self.manga_lod_target_scale_factor())
