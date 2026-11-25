@@ -1284,3 +1284,252 @@ pub(crate) fn returning_to_a_narrower_window_relays_the_grid_without_re_probing(
     assert!((viewer.masonry_layout_screen_x - 960.0).abs() <= 1.0);
     assert!(viewer.masonry_authoritative_dimension_lock_active());
 }
+
+fn long_strip_scroll_test_viewer(count: usize) -> ImageViewer {
+    let mut viewer = ImageViewer::default();
+    viewer.screen_size = egui::vec2(1920.0, 1080.0);
+    let files: Vec<std::path::PathBuf> = (0..count)
+        .map(|index| std::path::PathBuf::from(format!("strip_page_{index}.png")))
+        .collect();
+    viewer.set_image_list_raw(files);
+    viewer.manga_loader = Some(MangaLoader::new());
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for index in 0..count {
+            loader
+                .dimension_cache
+                .insert(index, (1080, 1920, MangaMediaType::StaticImage));
+        }
+    }
+    set_test_mode(&mut viewer, Mode::Strip(MangaLayoutMode::LongStrip));
+    viewer.zoom = 1.0;
+    viewer.manga_scroll_offset = 0.0;
+    viewer.manga_scroll_target = 0.0;
+    viewer.manga_scroll_velocity = 0.0;
+    viewer.manga_wheel_scroll_active = false;
+    let _ = viewer.manga_total_height();
+    viewer
+}
+
+#[test]
+pub(crate) fn scroll_dt_seeds_from_monitor_refresh_on_idle_and_pauses() {
+    let mut viewer = long_strip_scroll_test_viewer(8);
+    let t0 = Instant::now();
+
+    viewer.fps_display_refresh_hz = Some(144.0);
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    let dt_144 = viewer.advance_manga_scroll_dt_at(t0);
+    assert!(
+        (dt_144 - (1.0 / 144.0)).abs() < 1e-5,
+        "expected 1/144s seed, got {dt_144}"
+    );
+
+    // Same-frame lookup must return the cached dt rather than ~0ms.
+    assert_eq!(
+        viewer.advance_manga_scroll_dt_at(t0 + Duration::from_micros(50)),
+        dt_144
+    );
+
+    // Next frame at 200Hz uses exact elapsed wall time.
+    viewer.fps_display_refresh_hz = Some(200.0);
+    viewer.manga_scroll_frame_dt_s = None;
+    let dt_step = viewer.advance_manga_scroll_dt_at(t0 + Duration::from_millis(5));
+    assert!(
+        (dt_step - 0.005).abs() < 1e-5,
+        "expected 5ms, got {dt_step}"
+    );
+
+    // Elapsed > 50ms re-seeds with the active monitor period (5ms @ 200Hz) instead of a jump.
+    viewer.manga_scroll_frame_dt_s = None;
+    let dt_after_pause = viewer.advance_manga_scroll_dt_at(t0 + Duration::from_millis(80));
+    assert!(
+        (dt_after_pause - (1.0 / 200.0)).abs() < 1e-5,
+        "expected 1/200s seed after idle pause, got {dt_after_pause}"
+    );
+
+    // Extreme refresh rates are clamped safely to 1/500 ..= 1/30.
+    viewer.fps_display_refresh_hz = Some(1000.0);
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    assert!((viewer.advance_manga_scroll_dt_at(t0) - (1.0 / 500.0)).abs() < 1e-6);
+
+    viewer.fps_display_refresh_hz = Some(24.0);
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    assert!((viewer.advance_manga_scroll_dt_at(t0) - (1.0 / 30.0)).abs() < 1e-6);
+}
+
+#[test]
+pub(crate) fn held_pan_step_is_frame_rate_independent_across_60_144_200hz() {
+    let run_pan = |hz: usize| -> f32 {
+        let mut viewer = long_strip_scroll_test_viewer(20);
+        viewer.config.manga_arrow_scroll_speed = 400.0;
+        let dt = 1.0 / hz as f32;
+        for _ in 0..hz {
+            viewer.apply_manga_pan_step_with_dt(1.0, 1.0, dt);
+        }
+        viewer.manga_scroll_target
+    };
+
+    let d60 = run_pan(60);
+    let d144 = run_pan(144);
+    let d200 = run_pan(200);
+
+    assert!((d60 - 12_000.0).abs() < 0.05, "60Hz baseline: {d60}");
+    assert!((d144 - d60).abs() < 0.05, "144Hz={d144} vs 60Hz={d60}");
+    assert!((d200 - d60).abs() < 0.05, "200Hz={d200} vs 60Hz={d60}");
+}
+
+#[test]
+pub(crate) fn wheel_inertia_and_overscroll_spring_are_frame_rate_independent() {
+    let simulate_wheel = |hz: usize| -> (f32, f32) {
+        let mut viewer = long_strip_scroll_test_viewer(20);
+        assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
+        let dt = 1.0 / hz as f32;
+        let steps = hz / 4; // Exact 0.25s: 15 @ 60Hz, 36 @ 144Hz, 50 @ 200Hz
+        for _ in 0..steps {
+            let _ = viewer.manga_tick_scroll_animation(dt);
+        }
+        (viewer.manga_scroll_offset, viewer.manga_scroll_velocity)
+    };
+
+    let (off60, vel60) = simulate_wheel(60);
+    let (off144, vel144) = simulate_wheel(144);
+    let (off200, vel200) = simulate_wheel(200);
+
+    assert!(off60 > 50.0);
+    assert!(
+        (off144 - off60).abs() < 0.5,
+        "offset 144={off144} 60={off60}"
+    );
+    assert!(
+        (off200 - off60).abs() < 0.5,
+        "offset 200={off200} 60={off60}"
+    );
+    assert!((vel144 - vel60).abs() < 1.0, "vel 144={vel144} 60={vel60}");
+    assert!((vel200 - vel60).abs() < 1.0, "vel 200={vel200} 60={vel60}");
+
+    // Critically-damped overscroll spring at top boundary (offset < 0).
+    let simulate_spring = |hz: usize| -> (f32, f32) {
+        let mut viewer = long_strip_scroll_test_viewer(20);
+        viewer.manga_wheel_scroll_active = true;
+        viewer.manga_scroll_offset = -90.0;
+        viewer.manga_scroll_velocity = -300.0;
+        let dt = 1.0 / hz as f32;
+        let steps = hz / 4; // Exact 0.25s
+        for _ in 0..steps {
+            let _ = viewer.manga_tick_scroll_animation(dt);
+        }
+        (viewer.manga_scroll_offset, viewer.manga_scroll_velocity)
+    };
+
+    let (s60, sv60) = simulate_spring(60);
+    let (s144, sv144) = simulate_spring(144);
+    let (s200, sv200) = simulate_spring(200);
+
+    assert!(
+        s60 <= 0.0,
+        "critically-damped spring must not overshoot past 0: {s60}"
+    );
+    assert!((s144 - s60).abs() < 0.25, "spring 144={s144} 60={s60}");
+    assert!((s200 - s60).abs() < 0.25, "spring 200={s200} 60={s60}");
+    assert!(
+        (sv144 - sv60).abs() < 0.5,
+        "spring vel 144={sv144} 60={sv60}"
+    );
+    assert!(
+        (sv200 - sv60).abs() < 0.5,
+        "spring vel 200={sv200} 60={sv60}"
+    );
+}
+
+#[test]
+pub(crate) fn target_lerp_and_velocity_alpha_are_frame_rate_independent() {
+    let simulate_lerp = |hz: usize| -> (f32, f32) {
+        let mut viewer = long_strip_scroll_test_viewer(20);
+        viewer.manga_scroll_offset = 0.0;
+        viewer.manga_scroll_target = 600.0;
+        viewer.manga_scroll_velocity = 0.0;
+        let dt = 1.0 / hz as f32;
+        let steps = hz / 4; // Exact 0.25s
+        for _ in 0..steps {
+            let _ = viewer.manga_tick_scroll_animation(dt);
+        }
+        (viewer.manga_scroll_offset, viewer.manga_scroll_velocity)
+    };
+
+    let (l60, lv60) = simulate_lerp(60);
+    let (l144, lv144) = simulate_lerp(144);
+    let (l200, lv200) = simulate_lerp(200);
+
+    assert!((l144 - l60).abs() < 3.0, "lerp 144={l144} 60={l60}");
+    assert!((l200 - l60).abs() < 3.0, "lerp 200={l200} 60={l60}");
+    assert!(
+        (lv144 - lv60).abs() < 15.0,
+        "lerp vel 144={lv144} 60={lv60}"
+    );
+    assert!(
+        (lv200 - lv60).abs() < 15.0,
+        "lerp vel 200={lv200} 60={lv60}"
+    );
+}
+
+#[test]
+pub(crate) fn upload_budgets_and_active_scroll_gating_scale_with_refresh_rate() {
+    let mut viewer = long_strip_scroll_test_viewer(8);
+
+    viewer.fps_display_refresh_hz = Some(60.0);
+    assert!((viewer.manga_inline_upload_budget_ms(true) - 2.0).abs() < 1e-3);
+    assert!((viewer.manga_inline_upload_budget_ms(false) - 6.0).abs() < 1e-3);
+    let (s60, h60) = viewer.manga_upload_p95_soft_hard_budgets_ms();
+    assert!((s60 - 4.5).abs() < 0.05);
+    assert!((h60 - 7.5).abs() < 0.05);
+
+    viewer.fps_display_refresh_hz = Some(144.0);
+    assert!((viewer.manga_inline_upload_budget_ms(true) - 1.7361).abs() < 0.02);
+    assert!((viewer.manga_inline_upload_budget_ms(false) - 3.125).abs() < 0.02);
+    let (s144, h144) = viewer.manga_upload_p95_soft_hard_budgets_ms();
+    assert!(s144 < s60 && h144 < h60);
+
+    viewer.fps_display_refresh_hz = Some(200.0);
+    assert!((viewer.manga_inline_upload_budget_ms(true) - 1.25).abs() < 0.01);
+    assert!((viewer.manga_inline_upload_budget_ms(false) - 2.25).abs() < 0.01);
+    let (s200, h200) = viewer.manga_upload_p95_soft_hard_budgets_ms();
+    assert!((s200 - 1.35).abs() < 0.02);
+    assert!((h200 - 2.25).abs() < 0.02);
+
+    // Active scroll gates mipmaps and batch limits in Long Strip as well as Masonry and Gallery.
+    viewer.config.use_hardware_acceleration = true;
+    viewer.config.manga_mipmap_static = true;
+    viewer.config.manga_mipmap_min_side = 128;
+
+    for layout in [
+        MangaLayoutMode::LongStrip,
+        MangaLayoutMode::Masonry,
+        MangaLayoutMode::Gallery,
+    ] {
+        set_test_mode(&mut viewer, Mode::Strip(layout));
+        viewer.manga_wheel_scroll_active = true;
+        assert!(viewer.manga_navigation_active_for_heavy_work());
+        let policy = viewer.manga_upload_policy(0, MangaMediaType::StaticImage, (4096, 4096));
+        assert!(
+            policy.navigation_active,
+            "{layout:?} must veto mipmaps while actively scrolling"
+        );
+        assert!(!policy.mipmap_enabled((4096, 4096)));
+        let batch_limit = viewer.manga_compute_upload_batch_limit(8, 12);
+        if layout.is_grid() {
+            assert_eq!(batch_limit, ImageViewer::MANGA_UPLOAD_BATCH_MIN);
+        } else {
+            assert_eq!(batch_limit, 1);
+        }
+
+        // When settled, mipmaps re-enable cleanly for minified pages/tiles.
+        viewer.manga_wheel_scroll_active = false;
+        assert!(!viewer.manga_navigation_active_for_heavy_work());
+        let settled_policy =
+            viewer.manga_upload_policy(0, MangaMediaType::StaticImage, (4096, 4096));
+        assert!(!settled_policy.navigation_active);
+        assert!(settled_policy.mipmap_enabled((4096, 4096)));
+    }
+}
