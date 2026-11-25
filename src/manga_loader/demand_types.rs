@@ -62,11 +62,17 @@ pub struct Demand<'a> {
     pub previous_cache_capacity: usize,
     /// Indices the texture cache currently holds; the keep window evicts from this set.
     pub cached_indices: &'a [usize],
+    /// Actual resident RGBA bytes summed across `cached_indices`.
+    pub cached_resident_bytes: usize,
+    /// Optional per-entry `(index, rgba_bytes)` slice used to stop Long Strip eviction once
+    /// resident VRAM drops below budget.
+    pub cached_entry_bytes: &'a [(usize, usize)],
 }
 
 /// Loader-side answers for `Demand`. main.rs applies them to its texture cache.
 pub struct DemandPlan {
     pub cache_capacity: usize,
+    pub vram_budget_bytes: usize,
     pub pinned_indices: Vec<usize>,
     /// Cache entries outside the keep window; already forgotten by the loader.
     pub evicted_indices: Vec<usize>,

@@ -41,3 +41,12 @@ pub(crate) const MANGA_CACHE_MAX_ENTRIES: usize = 1024;
 pub(crate) const MASONRY_CACHE_BUDGET_BYTES_IDLE: usize = 768 * 1024 * 1024;
 
 pub(crate) const MASONRY_CACHE_BUDGET_BYTES_NAV: usize = 512 * 1024 * 1024;
+
+/// Shared VRAM budgets for both Long Strip and Masonry texture caches.
+pub(crate) const MANGA_CACHE_BUDGET_BYTES_IDLE: usize = MASONRY_CACHE_BUDGET_BYTES_IDLE;
+
+pub(crate) const MANGA_CACHE_BUDGET_BYTES_NAV: usize = MASONRY_CACHE_BUDGET_BYTES_NAV;
+
+pub(crate) fn safety_ceiling_bytes_for_budget(budget_bytes: usize) -> usize {
+    budget_bytes.saturating_add(budget_bytes / 4)
+}

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 /// Texture-side buckets used for masonry/strip LOD requests.
 /// Requests are rounded up to the next bucket to avoid churn from tiny deltas.
 pub const LOD_SIDE_BUCKETS: &[u32] = &[
-    96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 3072, 4096,
+    96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048, 2560, 3072, 4096, 5120, 6144,
 ];
 
 /// Layout fallbacks used when a header probe yields nothing usable.

@@ -33,7 +33,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 impl MangaLoader {
-    /// Coordinator loop that processes requests in parallel using Rayon.
+    /// Coordinator loop that processes requests in parallel using the dedicated decode pool.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn coordinator_loop(
         request_rx: Receiver<LoadRequest>,
         urgent_request_rx: Receiver<LoadRequest>,
@@ -43,7 +44,9 @@ impl MangaLoader {
         retry_state: Arc<RwLock<HashMap<usize, RetryState>>>,
         shutdown: Arc<AtomicBool>,
         generation: Arc<AtomicUsize>,
+        decode_pool: Arc<rayon::ThreadPool>,
     ) {
+        set_current_thread_below_normal();
         // Collect requests in batches for parallel processing
         let mut batch: Vec<LoadRequest> = Vec::with_capacity(16);
 
@@ -252,7 +255,7 @@ impl MangaLoader {
             let (outcome_tx, outcome_rx) = crossbeam_channel::unbounded();
             let mut disconnected = false;
 
-            rayon::scope(|scope| {
+            decode_pool.scope(|scope| {
                 for req in batch[start_index..].iter() {
                     let outcome_tx = outcome_tx.clone();
                     scope.spawn(move |_| {

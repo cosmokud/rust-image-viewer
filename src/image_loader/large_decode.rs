@@ -47,9 +47,9 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
 
-/// Shipped default of the `large_decode_threshold_megapixels` setting: the old fixed budget, so
-/// every image that loaded before it became configurable still loads exactly as fast.
-pub(crate) const DEFAULT_LARGE_DECODE_THRESHOLD_MP: u32 = 64;
+/// Shipped default of the `large_decode_threshold_megapixels` setting: keeps heavy 16+ MP
+/// frames serialized cleanly while smaller photos stay fully parallel.
+pub(crate) const DEFAULT_LARGE_DECODE_THRESHOLD_MP: u32 = 16;
 
 /// Lowest threshold that is actually published: zero would gate every single file. The upper end
 /// has no clamp here, because the 8-256 range in the registry table bounds the slider only and a
@@ -79,8 +79,8 @@ pub(crate) fn large_decode_threshold_pixels() -> u64 {
 /// Shipped default of `parallel_large_decodes`: one oversized decode at a time.
 pub(crate) const DEFAULT_PARALLEL_LARGE_DECODES: u8 = 1;
 
-/// Highest value the `parallel_large_decodes` setting accepts.
-pub(crate) const MAX_PARALLEL_LARGE_DECODES: u8 = 8;
+/// Highest value the `parallel_large_decodes` setting accepts, keeping RAM bandwidth bounded.
+pub(crate) const MAX_PARALLEL_LARGE_DECODES: u8 = 2;
 
 /// Longest a large decode waits for a permit before decoding anyway.
 pub(crate) const LARGE_DECODE_WAIT: Duration = Duration::from_secs(20);

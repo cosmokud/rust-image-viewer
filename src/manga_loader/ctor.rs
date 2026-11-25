@@ -72,13 +72,29 @@ impl MangaLoader {
         let retry_state = Arc::new(RwLock::new(HashMap::new()));
         let shutdown = Arc::new(AtomicBool::new(false));
         let generation = Arc::new(AtomicUsize::new(0));
+        let decode_pool = Arc::new(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(decode_worker_thread_count())
+                .thread_name(|i| format!("manga-decode-{i}"))
+                .start_handler(|_| set_current_thread_below_normal())
+                .build()
+                .unwrap_or_else(|_| {
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .thread_name(|i| format!("manga-decode-fallback-{i}"))
+                        .start_handler(|_| set_current_thread_below_normal())
+                        .build()
+                        .expect("single-thread manga decode pool")
+                }),
+        );
 
-        // Spawn a coordinator thread that processes requests using Rayon
+        // Spawn a coordinator thread that processes requests using the dedicated decode pool.
         let loading_clone = Arc::clone(&loading_indices);
         let loaded_clone = Arc::clone(&loaded_levels);
         let retry_clone = Arc::clone(&retry_state);
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
+        let decode_pool_clone = Arc::clone(&decode_pool);
 
         crate::async_runtime::spawn_blocking_or_thread("manga-loader-coordinator", move || {
             Self::coordinator_loop(
@@ -90,6 +106,7 @@ impl MangaLoader {
                 retry_clone,
                 shutdown_clone,
                 generation_clone,
+                decode_pool_clone,
             );
         });
 
@@ -97,7 +114,9 @@ impl MangaLoader {
         // Header-based size probes stay off the UI thread.
         let shutdown_clone = Arc::clone(&shutdown);
         let generation_clone = Arc::clone(&generation);
+        let dim_decode_pool = decode_pool;
         crate::async_runtime::spawn_blocking_or_thread("manga-dimension-worker", move || {
+            set_current_thread_below_normal();
             // Chunks the result channel refused. Re-emitted on the next pass: dropping them made
             // the tile fall back to 16:9 and re-probe, which is what stalled the gallery.
             let mut parked: std::collections::VecDeque<DimResult> =
@@ -123,6 +142,7 @@ impl MangaLoader {
                                         &dim_result_tx,
                                         &generation_clone,
                                         &mut parked,
+                                        Some(dim_decode_pool.as_ref()),
                                     );
                                 }
                                 continue;
@@ -169,7 +189,13 @@ impl MangaLoader {
                 };
 
                 if let Some(req) = Self::dim_request_ready(req, &generation_clone) {
-                    Self::run_dim_request(req, &dim_result_tx, &generation_clone, &mut parked);
+                    Self::run_dim_request(
+                        req,
+                        &dim_result_tx,
+                        &generation_clone,
+                        &mut parked,
+                        Some(dim_decode_pool.as_ref()),
+                    );
                 }
             }
         });
@@ -228,6 +254,8 @@ impl MangaTextureCache {
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
             last_pinned_sorted: Vec::new(),
+            resident_bytes: 0,
+            vram_budget_bytes: MANGA_CACHE_BUDGET_BYTES_IDLE,
         }
     }
 }

@@ -45,6 +45,10 @@ pub struct MangaTextureCache {
     pub(crate) pinned_indices: HashSet<usize>,
     /// Last sorted pinned slice, used to skip redundant set_pinned_indices churn.
     pub(crate) last_pinned_sorted: Vec<usize>,
+    /// Sum of RGBA bytes (`width * height * 4`) across all currently cached textures.
+    pub(crate) resident_bytes: usize,
+    /// Soft GPU memory budget enforced during LRU eviction.
+    pub(crate) vram_budget_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -58,18 +62,40 @@ pub(crate) struct MangaTextureEntry {
 }
 
 impl MangaTextureCache {
+    #[inline]
+    pub(crate) fn entry_rgba_bytes(width: u32, height: u32) -> usize {
+        (width as usize)
+            .saturating_mul(height as usize)
+            .saturating_mul(4)
+    }
+
+    pub fn resident_bytes(&self) -> usize {
+        self.resident_bytes
+    }
+
     pub(crate) fn total_entries(&self) -> usize {
         self.pinned_entries.len() + self.unpinned_entries.len()
     }
 
-    pub(crate) fn evict_to_capacity(&mut self) -> Vec<usize> {
+    pub(crate) fn evict_to_capacity_with_policy(
+        &mut self,
+        allow_normal_eviction: bool,
+        safety_ceiling_bytes: usize,
+    ) -> Vec<usize> {
         let mut evicted = Vec::new();
 
-        while self.total_entries() > self.max_entries {
-            let Some((idx, _)) = self.unpinned_entries.pop_lru() else {
+        while (allow_normal_eviction
+            && (self.total_entries() > self.max_entries
+                || self.resident_bytes > self.vram_budget_bytes))
+            || self.resident_bytes > safety_ceiling_bytes
+        {
+            let Some((idx, entry)) = self.unpinned_entries.pop_lru() else {
                 // All remaining entries are pinned; cannot evict further.
                 break;
             };
+
+            let removed_bytes = Self::entry_rgba_bytes(entry.width, entry.height);
+            self.resident_bytes = self.resident_bytes.saturating_sub(removed_bytes);
 
             if self.pinned_indices.remove(&idx) {
                 self.last_pinned_sorted.clear();
@@ -80,11 +106,18 @@ impl MangaTextureCache {
         evicted
     }
 
-    pub fn set_max_entries(&mut self, max_entries: usize) -> Vec<usize> {
+    pub fn set_limits_and_maybe_evict(
+        &mut self,
+        max_entries: usize,
+        vram_budget_bytes: usize,
+        defer_non_critical_eviction: bool,
+    ) -> Vec<usize> {
         self.max_entries = max_entries.max(1);
+        self.vram_budget_bytes = vram_budget_bytes.max(1);
         let capacity = NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
         self.unpinned_entries.resize(capacity);
-        self.evict_to_capacity()
+        let safety_ceiling = safety_ceiling_bytes_for_budget(self.vram_budget_bytes);
+        self.evict_to_capacity_with_policy(!defer_non_critical_eviction, safety_ceiling)
     }
 
     pub fn set_pinned_indices<I>(&mut self, pinned: I)
@@ -285,6 +318,33 @@ impl MangaTextureCache {
         media_type: MangaMediaType,
         mipmap_deferred: bool,
     ) -> Vec<usize> {
+        self.insert_with_type_and_eviction_policy(
+            index,
+            path,
+            texture,
+            width,
+            height,
+            media_type,
+            mipmap_deferred,
+            false,
+        )
+    }
+
+    /// Insert a texture while optionally deferring non-critical eviction until scroll settles
+    /// (unless `resident_bytes` exceeds the 1.25x VRAM safety ceiling).
+    #[allow(clippy::too_many_arguments)]
+    pub fn insert_with_type_and_eviction_policy(
+        &mut self,
+        index: usize,
+        path: PathBuf,
+        texture: egui::TextureHandle,
+        width: u32,
+        height: u32,
+        media_type: MangaMediaType,
+        mipmap_deferred: bool,
+        defer_non_critical_eviction: bool,
+    ) -> Vec<usize> {
+        let new_bytes = Self::entry_rgba_bytes(width, height);
         let entry = MangaTextureEntry {
             path,
             texture,
@@ -294,15 +354,30 @@ impl MangaTextureCache {
             mipmap_deferred,
         };
 
+        if let Some(prev) = self.pinned_entries.remove(&index) {
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(Self::entry_rgba_bytes(prev.width, prev.height));
+        }
+        if let Some(prev) = self.unpinned_entries.pop(&index) {
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(Self::entry_rgba_bytes(prev.width, prev.height));
+        }
+
+        self.resident_bytes = self.resident_bytes.saturating_add(new_bytes);
         if self.pinned_indices.contains(&index) {
-            self.unpinned_entries.pop(&index);
             self.pinned_entries.insert(index, entry);
         } else {
-            self.pinned_entries.remove(&index);
             self.unpinned_entries.put(index, entry);
         }
 
-        self.evict_to_capacity()
+        let safety_ceiling = if defer_non_critical_eviction {
+            safety_ceiling_bytes_for_budget(self.vram_budget_bytes)
+        } else {
+            self.vram_budget_bytes
+        };
+        self.evict_to_capacity_with_policy(!defer_non_critical_eviction, safety_ceiling)
     }
 
     /// Update an existing texture in the cache (for video frame updates).
@@ -315,10 +390,16 @@ impl MangaTextureCache {
         width: u32,
         height: u32,
     ) -> bool {
+        let new_bytes = Self::entry_rgba_bytes(width, height);
         if let Some(entry) = self.pinned_entries.get_mut(&index) {
             if entry.path.as_path() != path {
                 return false;
             }
+            let prev_bytes = Self::entry_rgba_bytes(entry.width, entry.height);
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(prev_bytes)
+                .saturating_add(new_bytes);
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
@@ -330,6 +411,11 @@ impl MangaTextureCache {
             if entry.path.as_path() != path {
                 return false;
             }
+            let prev_bytes = Self::entry_rgba_bytes(entry.width, entry.height);
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(prev_bytes)
+                .saturating_add(new_bytes);
             entry.texture = texture;
             entry.width = width;
             entry.height = height;
@@ -342,8 +428,16 @@ impl MangaTextureCache {
 
     /// Remove an entry from the cache.
     pub fn remove(&mut self, index: usize) {
-        self.pinned_entries.remove(&index);
-        self.unpinned_entries.pop(&index);
+        if let Some(prev) = self.pinned_entries.remove(&index) {
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(Self::entry_rgba_bytes(prev.width, prev.height));
+        }
+        if let Some(prev) = self.unpinned_entries.pop(&index) {
+            self.resident_bytes = self
+                .resident_bytes
+                .saturating_sub(Self::entry_rgba_bytes(prev.width, prev.height));
+        }
         if self.pinned_indices.remove(&index) {
             self.last_pinned_sorted.clear();
         }
@@ -360,5 +454,21 @@ impl MangaTextureCache {
         out.reserve(self.total_entries());
         out.extend(self.pinned_entries.keys().copied());
         out.extend(self.unpinned_entries.iter().map(|(idx, _)| *idx));
+    }
+
+    /// Get `(index, rgba_bytes)` for all cached textures into a caller-owned scratch buffer.
+    pub fn cached_entries_bytes_into(&self, out: &mut Vec<(usize, usize)>) {
+        out.clear();
+        out.reserve(self.total_entries());
+        out.extend(
+            self.pinned_entries
+                .iter()
+                .map(|(&idx, entry)| (idx, Self::entry_rgba_bytes(entry.width, entry.height))),
+        );
+        out.extend(
+            self.unpinned_entries
+                .iter()
+                .map(|(&idx, entry)| (idx, Self::entry_rgba_bytes(entry.width, entry.height))),
+        );
     }
 }

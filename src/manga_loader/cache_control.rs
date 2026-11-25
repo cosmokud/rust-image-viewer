@@ -202,5 +202,6 @@ impl MangaTextureCache {
         self.unpinned_entries.clear();
         self.pinned_indices.clear();
         self.last_pinned_sorted.clear();
+        self.resident_bytes = 0;
     }
 }

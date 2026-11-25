@@ -146,15 +146,15 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
     // sibling test left in the process-wide atomic.
     let _limits = decode_limit_guard();
     set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
-    assert_eq!(large_decode_threshold_pixels(), 64 * MEGAPIXEL);
+    assert_eq!(large_decode_threshold_pixels(), 16 * MEGAPIXEL);
 
     assert!(
-        !needs_large_decode_permit(8_000, 8_000),
-        "64 MP is not gated"
+        !needs_large_decode_permit(4_000, 4_000),
+        "16 MP is not gated"
     );
     assert!(
-        needs_large_decode_permit(8_192, 8_192),
-        "67 MP is above the gate"
+        needs_large_decode_permit(6_000, 4_000),
+        "24 MP is above the gate"
     );
     assert!(needs_large_decode_permit(10_835, 16_097), "174 MP is gated");
 
@@ -234,7 +234,7 @@ pub(crate) fn memory_guard_refuses_decodes_that_cannot_fit() {
     // decode is what the normal parallel path is for.
     set_available_memory_for_tests(Some(64 * 1024 * 1024));
     assert_eq!(memory_budget_error(4_000, 3_000), None);
-    assert_eq!(memory_budget_error(8_000, 8_000), None);
+    assert_eq!(memory_budget_error(4_000, 4_000), None);
     // Above the threshold the floor (`MIN_DECODE_ALLOWANCE_BYTES`) still applies, so a 67 MP file
     // is admitted and a 100 MP one (~464 MiB) is not.
     assert_eq!(memory_budget_error(8_192, 8_192), None);

@@ -863,7 +863,7 @@ pub const SETTINGS: &[Setting] = &[
         tab: SettingsTab::Performance,
         label: "Large decode threshold megapixels",
         group: "Decode Limits",
-        help: "Images above this size count as large: they take the limited slots set by the row below and they are the ones checked against free RAM. 64 MP (the default) is where a full RGBA frame stops being cheap, roughly 256 MiB before the decoder overhead. Raise it to give more of the library the fully parallel path, lower it to bound memory on a smaller machine. The 8-256 slider range is for convenience only: type any number or write it into config.ini and it is used exactly as typed.",
+        help: "Images above this size count as large: they take the limited slots set by the row below and they are the ones checked against free RAM. 16 MP (the default) keeps high-res batches smooth without memory/allocator stalls. Raise it to give more of the library the fully parallel path, lower it to bound memory on a smaller machine. The 8-256 slider range is for convenience only: type any number or write it into config.ini and it is used exactly as typed.",
         kind: SettingKind::Int {
             min: 8,
             max: 256,
@@ -880,10 +880,10 @@ pub const SETTINGS: &[Setting] = &[
         tab: SettingsTab::Performance,
         label: "Large image decodes at once",
         group: "Decode Limits",
-        help: "How many images above the large decode threshold may decode at the same time. 1 (the default) keeps the peak memory of a gallery or Long Strip sweep bounded, because each such file needs most of a gigabyte while it decodes. Raise it on a machine with plenty of RAM to fill a large grid faster.",
+        help: "How many images above the large decode threshold may decode at the same time (1-2). 1 (the default) keeps peak memory bandwidth and heap contention minimal during gallery or Long Strip sweeps.",
         kind: SettingKind::Int {
             min: 1,
-            max: 8,
+            max: 2,
             slider_only: false,
             hard_min: 1,
         },

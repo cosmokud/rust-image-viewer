@@ -84,6 +84,70 @@ impl DecodedImage {
     }
 }
 
+/// Minimum allocation size routed to the background free thread (~512 KiB).
+pub(crate) const LARGE_DROP_MIN_BYTES: usize = 512 * 1024;
+
+/// Lowers the current worker thread priority so background decode/probe/free work never
+/// starves the UI, OpenGL, or DWM compositor threads at high refresh rates.
+pub(crate) fn set_current_thread_below_normal() {
+    #[cfg(windows)]
+    unsafe {
+        winapi::um::processthreadsapi::SetThreadPriority(
+            winapi::um::processthreadsapi::GetCurrentThread(),
+            winapi::um::winbase::THREAD_PRIORITY_BELOW_NORMAL as winapi::ctypes::c_int,
+        );
+    }
+}
+
+/// Worker count for background decode pools, leaving cores headroom for UI + OpenGL + DWM.
+pub(crate) fn decode_worker_thread_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .saturating_sub(2)
+        .clamp(1, 6)
+}
+
+/// Drops an owned large buffer on a dedicated below-normal-priority background thread so the
+/// UI thread never stalls inside synchronous OS deallocation (`VirtualFree`).
+pub(crate) fn defer_large_drop<T: Send + 'static>(item: T) {
+    use std::any::Any;
+    use std::sync::mpsc::{self, Sender};
+    use std::sync::OnceLock;
+
+    static DROP_TX: OnceLock<Sender<Box<dyn Any + Send>>> = OnceLock::new();
+    let tx = DROP_TX.get_or_init(|| {
+        let (tx, rx) = mpsc::channel::<Box<dyn Any + Send>>();
+        let _ = std::thread::Builder::new()
+            .name("bg-large-dropper".to_string())
+            .spawn(move || {
+                set_current_thread_below_normal();
+                while let Ok(boxed) = rx.recv() {
+                    drop(boxed);
+                }
+            });
+        tx
+    });
+    let _ = tx.send(Box::new(item));
+}
+
+pub(crate) fn drop_color_image_off_thread(image: egui::ColorImage) {
+    let bytes = image
+        .pixels
+        .len()
+        .saturating_mul(std::mem::size_of::<egui::Color32>());
+    if bytes >= LARGE_DROP_MIN_BYTES {
+        defer_large_drop(image);
+    }
+}
+
+pub(crate) fn drop_decoded_batch_off_thread(items: Vec<DecodedImage>) {
+    let total_bytes: usize = items.iter().map(DecodedImage::pixel_bytes).sum();
+    if total_bytes >= LARGE_DROP_MIN_BYTES {
+        defer_large_drop(items);
+    }
+}
+
 /// Request sent to the loader thread pool.
 #[derive(Clone)]
 pub struct LoadRequest {

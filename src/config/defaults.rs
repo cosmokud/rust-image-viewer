@@ -93,7 +93,7 @@ impl Config {
             metadata_cache_max_size_mb: 1024,
             masonry_metadata_ram_cache_limit_mb: 2048,
             max_decode_megapixels: 256,
-            large_decode_threshold_megapixels: 64,
+            large_decode_threshold_megapixels: 16,
             parallel_large_decodes: 1,
             decode_memory_guard: true,
             // Image quality defaults

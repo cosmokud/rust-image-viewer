@@ -219,7 +219,17 @@ impl MangaLoader {
                     .and_then(|ext| ext.to_str())
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("gif"));
 
-                let downscale_filter = req.downscale_filter;
+                // For >=12 MP static images in Long Strip, use CatmullRom instead of Lanczos3 to cut
+                // downscale CPU work 2-3x while keeping high visual crispness.
+                let is_large_static = u64::from(original_width)
+                    .saturating_mul(u64::from(original_height))
+                    >= 12 * 1_000_000;
+                let downscale_filter =
+                    if is_large_static && req.downscale_filter == FilterType::Lanczos3 {
+                        FilterType::CatmullRom
+                    } else {
+                        req.downscale_filter
+                    };
                 let gif_filter = req.gif_filter;
 
                 let mut img = if is_animated_webp || is_gif {

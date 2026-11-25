@@ -462,7 +462,7 @@ impl MangaLoader {
         // two decodes per worker, whichever is larger. Priorities sort the visible index (and any
         // urgent demand) first, and those are exempt, so the cap can only cut speculative work.
         let window = end_idx.saturating_sub(start_idx);
-        let max_inflight = window.max(rayon::current_num_threads().saturating_mul(2));
+        let max_inflight = window.max(decode_worker_thread_count().saturating_mul(2));
         let mut inflight = self.loading_indices.read().len();
 
         requests.sort_by_key(|r| r.priority);

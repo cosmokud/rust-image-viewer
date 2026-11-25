@@ -48,54 +48,63 @@ impl MangaLoader {
         dim_result_tx: &Sender<DimResult>,
         generation: &AtomicUsize,
         parked: &mut std::collections::VecDeque<DimResult>,
+        decode_pool: Option<&rayon::ThreadPool>,
     ) {
-        let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
-            .items
-            .into_par_iter()
-            .filter_map(|(idx, path)| {
-                let is_video = is_supported_video(&path);
-                let is_image = is_supported_image(&path);
+        let probe_batch = || {
+            let mut out: Vec<(usize, u32, u32, MangaMediaType)> = req
+                .items
+                .into_par_iter()
+                .filter_map(|(idx, path)| {
+                    let is_video = is_supported_video(&path);
+                    let is_image = is_supported_image(&path);
 
-                if !is_video && !is_image {
-                    return None;
-                }
+                    if !is_video && !is_image {
+                        return None;
+                    }
 
-                let media_type = if is_video {
-                    MangaMediaType::Video
-                } else {
-                    MangaMediaType::StaticImage
-                };
+                    let media_type = if is_video {
+                        MangaMediaType::Video
+                    } else {
+                        MangaMediaType::StaticImage
+                    };
 
-                // Breadcrumb before a probe: same reason as the decode one.
-                crate::diag::note_file(idx, "dim-probe", || {
-                    format!(
-                        "idx={} file={} bytes={} kind={}",
-                        idx,
-                        diag_file_label(&path),
-                        std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
-                        if is_video { "video" } else { "image" }
-                    )
-                });
+                    // Breadcrumb before a probe: same reason as the decode one.
+                    crate::diag::note_file(idx, "dim-probe", || {
+                        format!(
+                            "idx={} file={} bytes={} kind={}",
+                            idx,
+                            diag_file_label(&path),
+                            std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0),
+                            if is_video { "video" } else { "image" }
+                        )
+                    });
 
-                let dims = if is_video {
-                    Self::probe_video_dimensions(idx, &path)
-                } else {
-                    Self::probe_image_dimensions_cached(&path)
-                };
+                    let dims = if is_video {
+                        Self::probe_video_dimensions(idx, &path)
+                    } else {
+                        Self::probe_image_dimensions_cached(&path)
+                    };
 
-                let (w, h) = if let Some((w, h)) = dims {
-                    (w, h)
-                } else if is_video {
-                    FALLBACK_VIDEO_DIMENSIONS
-                } else {
-                    FALLBACK_IMAGE_DIMENSIONS
-                };
+                    let (w, h) = if let Some((w, h)) = dims {
+                        (w, h)
+                    } else if is_video {
+                        FALLBACK_VIDEO_DIMENSIONS
+                    } else {
+                        FALLBACK_IMAGE_DIMENSIONS
+                    };
 
-                Some((idx, w, h, media_type))
-            })
-            .collect();
+                    Some((idx, w, h, media_type))
+                })
+                .collect();
 
-        out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
+            out.par_sort_unstable_by_key(|(idx, _, _, _)| *idx);
+            out
+        };
+        let out = if let Some(pool) = decode_pool {
+            pool.install(probe_batch)
+        } else {
+            probe_batch()
+        };
 
         for chunk in out.chunks(DIM_RESULT_CHUNK_SIZE) {
             // Generation may advance while probing; avoid pushing obsolete results. The
