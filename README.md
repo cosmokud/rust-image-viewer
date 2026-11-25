@@ -76,6 +76,7 @@ It is not a bloated photo editor, cloud-synced cataloger, or heavy DAM. It focus
 - **Dedicated Stash Window for Asset Curation:** Mark, collect, filter, preview, and organize files across multiple folders in a standalone gallery window with drag-and-drop, badges, and a file details inspector.
 - **Safe File Management with Full Undo & Redo:** Use `Ctrl+Z` / `Ctrl+Y` to undo or redo Recycle Bin deletions, file renames, and Stash changes behind detached confirmation dialogs that verify the file is still restorable.
 - **Searchable Settings UI & Plain `.ini` Config:** Manage live presets, reset individual options to defaults, or edit every parameter directly in a human-readable `.ini` file.
+- **Very Large Photos:** Stills up to a configurable 256 MP open in full quality; a Decode Limits card in Settings bounds how many oversized images decode at once and refuses one that would not fit in free RAM.
 - **Portable & Installer Builds (AVX2 + Legacy SSE4.2):** Choose between standard AVX2 (`x86-64-v3`) builds for modern PCs and SSE4.2 (`-legacy`) builds for older CPUs, available as standalone portable `.exe` binaries or installers with GStreamer bundled.
 
 ---

@@ -178,7 +178,7 @@ Quick index of the hot entry points:
 | Where is a video frame scaled? | `src/video_player/player_frames.rs` + `src/texture_upload.rs` |
 | Where is a window moved/resized? | `src/app/window/*`, `src/window_geometry.rs`, `src/windows_env.rs` |
 | Where is the metadata cache written? | `src/metadata_cache/writer.rs` |
-| Where is a decode-size limit enforced? | `src/image_loader/budget.rs`, `src/texture_upload.rs` |
+| Where is a decode-size limit enforced? | `src/image_loader/budget.rs`, `src/image_loader/large_decode.rs`, `src/image_loader/memory_budget.rs`, `src/texture_upload.rs` |
 
 Two structural notes:
 
@@ -646,17 +646,22 @@ fallback (`image_decode.rs`). Techniques:
 - `imagesize` header probing before any allocation (`probe.rs`),
 - `memmap2`-backed reader with a buffered fallback (`reader.rs`),
 - decode budget from the header (`budget.rs`): the ceiling is the `max_decode_megapixels`
-  setting (default 256 MP, counted in decimal megapixels) published into an atomic, plus
-  `MIN_DECODE_ALLOC_BYTES = 256 MiB` and `DEFAULT_MAX_DECODE_ALLOC_BYTES = 4 GiB`. The RGBA
-  ceiling is `4 x ceiling + 128 MiB` of decoder scratch,
+  setting (default 256 MP, decimal megapixels, clamped to `ABSOLUTE_MAX_DECODED_PIXELS = 1024 MP`)
+  published into an `AtomicU64` by `set_max_decode_megapixels`, plus
+  `MIN_DECODE_ALLOC_BYTES = 256 MiB` and `DEFAULT_MAX_DECODE_ALLOC_BYTES = 4 GiB` for the
+  header-derived `max_alloc`. The RGBA ceiling is `4 x ceiling + 128 MiB` of decoder scratch. The
+  order of the two checks matters: the ceiling runs first, so a file that is simply too big reports
+  the ceiling rather than a memory problem,
 - `large_decode.rs`: decodes whose header declares more than `large_decode_threshold_megapixels`
   (default 64 MP) take a permit (`parallel_large_decodes`, default 1) that yields to rayon
   (never parks, bounded wait) so a masonry sweep cannot hold several gigabyte-sized frames at
-  once. The threshold is one atomic both this gate and the memory guard read,
+  once. The threshold is one atomic both this gate and the memory guard read, so everything at or
+  below it stays fully parallel,
 - `memory_budget.rs`: one `GlobalMemoryStatusEx` before an oversized decode; a file above the
-  threshold that needs more than half of the available physical memory is refused with a
-  message naming the setting instead of thrashing the pagefile. Disabled where the platform
-  cannot report memory,
+  threshold that needs more than `DECODE_AVAILABLE_RAM_SHARE = 0.5` of the available physical
+  memory is refused with a message naming the setting instead of thrashing the pagefile. Files
+  below the threshold are never refused, and an unknown memory reading disables the guard rather
+  than guessing,
 - `fast_image_resize` for the hot resize, `image::imageops::resize` only when FIR rejects the
   buffer (`src/image_resize.rs`),
 - natural sort of directory entries (`sorting.rs`), `.lnk`-to-folder resolution
@@ -776,13 +781,20 @@ payload before it can cost 2× in `color_image`.
 
 ### 11.3 Settings (`src/settings_registry/`)
 
-- `table.rs`: `SETTINGS` — 140 entries, each `Setting { key, tab, kind, control, default, help,
-  bounds }`. This is the single declaration of every editable value.
+- `table.rs`: `SETTINGS` — 145 entries, each `Setting { id, key, tab, label, group, help, kind,
+  applies, unused, action }`. This is the single declaration of every editable value; `id` equals the
+  table index (a new entry renumbers the tail, so `api.rs` ids must move with it) and `group` is the
+  card the row is drawn under (e.g. Performance holds `Hardware`, `Decode Limits`, `Image scaling`).
 - `types.rs`: `SettingsTab` (`General, Appearance, ZoomScroll, Motion, Autoscroll, Window, Files,
   Video, Performance, Shortcuts`), `SettingKind`, `RowControl`, `SettingValue`, `Applies`.
 - `accessors.rs`: generic `value_of` / `set_bool` / `set_num_field` / `set_text` over `Config`.
 - `api.rs`: `get`, `get_num`, `set`, `set_num`, `capture`, `apply_values`,
   `setting_index_for_key`, `settings_search_results`, `app_consequence`.
+- `AppConsequence` (`types.rs`) is the live-apply hook: `apply_values` reports which settings need
+  the app to do something beyond writing `Config`. Most rows need nothing; the decode limits
+  (`DecodeMegapixels`, `LargeDecodeThreshold`, `ParallelLargeDecodes`, `DecodeMemoryGuard`) exist
+  because the decoders run on threads without `&Config`, so `src/app/mod.rs` republishes those
+  values into the atomics in `image_loader/budget.rs`, `large_decode.rs`, `memory_budget.rs`.
 - `text.rs`: value formatting, section names, and cross-setting guards (e.g. autoscroll min ≤
   max).
 - `presets.rs`: render/parse/rewrite of a preset file and the `default.ini` + user preset
@@ -1009,6 +1021,9 @@ active Criterion harness; `benches/` is present but empty.
 | Adaptive video frame queue | `src/video_player/state.rs` | Fresher frames, bounded memory |
 | Buffer pool reuse | `src/video_player/state.rs` | No per-frame allocation churn |
 | GIF sliding window | `src/image_loader/gif_decode.rs` | Bounded RAM on huge GIFs |
+| Configurable megapixel ceiling | `src/image_loader/budget.rs` | 256 MP default (up from a fixed 64 MP) keeps huge photos opening |
+| Oversized-decode permit gate | `src/image_loader/large_decode.rs` | Above the threshold, rayon-yielding permits bound peak RAM |
+| Available-RAM decode guard | `src/image_loader/memory_budget.rs` | One `GlobalMemoryStatusEx` refuses a decode that would thrash the pagefile |
 | Animated WebP streaming | `src/image_loader/webp_stream.rs` | First frame now, rest later |
 | Off-thread cache writes | `src/metadata_cache/writer.rs` | File I/O off the frame path |
 | Hidden cloaked video start | `src/app/bootstrap.rs`, `src/app/window/startup.rs` | No startup flash, valid window rects |
@@ -1082,7 +1097,7 @@ active Criterion harness; `benches/` is present but empty.
 | --- | --- |
 | `interprocess` | Single-instance IPC |
 | `winapi` | Window state, environment, mutex, subclassing |
-| `windows` | Shell/COM interop (shortcut resolution, reveal in Explorer) |
+| `windows` | Shell/COM interop (shortcut resolution, reveal in Explorer), `GlobalMemoryStatusEx` for the decode RAM guard |
 | `clipboard-win` | Cut/copy/paste file lists |
 | `raw-window-handle` | Same version as eframe/winit, for `HasWindowHandle` |
 | `winres`, `fs_extra`, `directories` (build-deps) | Icon embedding, build-time config sync |

@@ -15,6 +15,12 @@
 2. Legacy config file names (`rust-image-viewer-config.ini`, `setting.ini`) are migrated automatically.
 3. Set a shortcut value to empty to disable its default binding.
 
+## Images
+
+1. `Image is too large to decode` — the file exceeds `max_decode_megapixels` (default 256 MP). Raise it in Settings -> Performance -> Decode Limits, or in `config.ini`.
+2. `Not enough free memory to decode` — the file is above `large_decode_threshold_megapixels` and needs more than half of the currently available RAM. Close something, or raise the threshold so the check stops applying to files that size.
+3. Large images load slowly one at a time — that is `parallel_large_decodes = 1`. Raise it (up to 8) on a machine with plenty of RAM.
+
 ## Cache
 
 1. If metadata seems stale, delete `%LOCALAPPDATA%\rust-image-viewer\metadata_cache.redb`. The app also resets the cache automatically on schema changes or corruption.

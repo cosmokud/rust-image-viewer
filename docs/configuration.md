@@ -71,17 +71,12 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `use_hardware_acceleration`   | `true`  | Master switch for hardware-accelerated paths.             |
 | `enable_d3d12`                | `true`  | Prefer D3D12 decoders (falls back to D3D11).              |
 | `enable_cuda`                 | `true`  | Enable CUDA decoder preference where supported.           |
+| `max_decode_megapixels`       | `256`   | Largest still image the decoder opens, in decimal megapixels (`width x height / 1,000,000`); raise it for 150-200 MP panoramas, lower it to cap RAM. |
+| `large_decode_threshold_megapixels` | `64` | Images above this size count as large: they take the limited slots below and are the ones checked against free RAM. |
+| `parallel_large_decodes`      | `1`     | How many images above the threshold may decode at once. 1 bounds the peak memory of a gallery sweep; raise it on a big-RAM machine. |
+| `decode_memory_guard`         | `true`  | Refuse a decode that needs more than half of the memory Windows reports as available, instead of thrashing the pagefile. |
 
-## Decode limits
-
-The Decode Limits card in Settings -> Performance owns these four keys.
-
-| Key                             | Default    | Meaning                                                                           |
-| ------------------------------- | ---------- | --------------------------------------------------------------------------------- |
-| `max_decode_megapixels`         | `256`      | Largest still image the decoder opens, in megapixels (`width x height / 1,000,000`); raise for 150-200 MP panoramas, lower to cap RAM. |
-| `large_decode_threshold_megapixels` | `64`   | Images above this size count as large: they take the limited slots below and are the ones checked against free RAM. |
-| `parallel_large_decodes`        | `1`        | How many images above the threshold may decode at once. 1 bounds the peak memory of a gallery sweep; raise on a big-RAM machine. |
-| `decode_memory_guard`           | `true`     | Refuse a decode that needs more than half of the memory Windows reports as available, instead of thrashing the pagefile. |
+The last four form the **Decode Limits** card in Settings -> Performance.
 
 ## Quality
 
