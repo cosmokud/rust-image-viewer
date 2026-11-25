@@ -6,9 +6,9 @@
 
 - `max_decode_megapixels` (Settings → Performance, "Image scaling", 8–1024, default **256**): the largest still image the decoder will open, counted in decimal megapixels. It replaces the fixed 64 MP ceiling that refused every 150–200 MP photo with "Image is too large to decode". The "too large" message now names the setting, and the value applies immediately — no restart.
 
-### Changed
+- `parallel_large_decodes` (Settings → Performance → "Image scaling", 1-8, default **1**): how many images over 64 MP may decode at once. Permits are taken only above that size, the wait yields to rayon instead of parking, and the bounded wait means the gate can slow a sweep down but never fail a load.
 
-- Decodes whose header declares more than 64 MP run one at a time (a permit that yields to rayon instead of parking, with a bounded wait), so a Masonry or thumbnail sweep cannot hold several gigabyte-sized frames in memory at once.
+- `decode_memory_guard` (same card, default **on**): before an oversized decode, compare the file's declared size with the memory Windows reports as available and refuse it with a message naming the setting when it would need more than half of that. One `GlobalMemoryStatusEx` call per oversized decode; stays out of the way where the platform cannot report memory.
 
 ### Fixed
 

@@ -78,6 +78,14 @@ impl ImageViewer {
                         self.config.max_decode_megapixels,
                     )
                 }
+                crate::settings_registry::AppConsequence::ParallelLargeDecodes => {
+                    crate::image_loader::set_parallel_large_decodes(
+                        self.config.parallel_large_decodes,
+                    )
+                }
+                crate::settings_registry::AppConsequence::DecodeMemoryGuard => {
+                    crate::image_loader::set_memory_guard_enabled(self.config.decode_memory_guard)
+                }
             }
         }
     }

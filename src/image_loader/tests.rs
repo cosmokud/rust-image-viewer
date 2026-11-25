@@ -102,8 +102,8 @@ pub(crate) fn decode_budget_follows_the_configured_megapixel_ceiling() {
     assert_eq!(max_decoded_pixels(), DEFAULT_MAX_DECODED_PIXELS);
 }
 
-/// The oversized-decode gate must be a no-op for ordinary photos and exclusive above the
-/// threshold, so a masonry sweep cannot hold two 800 MiB frames at once.
+/// The oversized-decode gate must be a no-op for ordinary photos and bounded above the
+/// threshold, so a masonry sweep cannot hold several gigabyte-sized frames at once.
 #[test]
 pub(crate) fn large_decode_gate_only_covers_oversized_images() {
     use std::sync::Arc;
@@ -118,24 +118,68 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
     );
     assert!(needs_large_decode_permit(10_835, 16_097), "174 MP is gated");
 
-    let gate = Arc::new(LargeDecodeGate::new());
+    // Default: one permit, so a second oversized decode waits.
+    let gate = Arc::new(LargeDecodeGate::new(1));
     assert!(
         gate.permit_for(1_000, 1_000).is_none(),
-        "ordinary sizes never touch the slot"
+        "ordinary sizes never take a permit"
     );
-    assert!(gate.is_free());
+    assert_eq!(gate.running(), 0);
 
     let held = gate.permit_for(16_000, 16_000).expect("256 MP is gated");
-    assert!(!gate.is_free(), "the first holder owns the slot");
+    assert_eq!(gate.running(), 1);
     drop(held);
-    assert!(gate.is_free(), "dropping the permit frees the slot");
+    assert_eq!(gate.running(), 0, "dropping the permit frees it");
 
-    // A permit taken in the same process can be re-acquired after release, which is what makes
-    // the next oversized file in a folder load at all.
-    let again = gate.permit_for(10_835, 16_097).expect("174 MP is gated");
-    assert!(!gate.is_free());
-    drop(again);
-    assert!(gate.is_free());
+    // Raising the setting lets that many run at once.
+    let gate = Arc::new(LargeDecodeGate::new(2));
+    let first = gate.permit_for(16_000, 16_000).expect("gated");
+    let second = gate.permit_for(10_835, 16_097).expect("gated");
+    assert_eq!(gate.running(), 2);
+    drop(first);
+    drop(second);
+    assert_eq!(gate.running(), 0);
+
+    // A permit is released exactly once even when two threads let go together.
+    let gate = Arc::new(LargeDecodeGate::new(1));
+    let held = gate.permit_for(16_000, 16_000).expect("gated");
+    std::thread::scope(|scope| {
+        let gate = Arc::clone(&gate);
+        scope.spawn(move || {
+            let _ = gate.permit_for(16_000, 16_000);
+        });
+        drop(held);
+    });
+    assert_eq!(gate.running(), 0);
+}
+
+/// The RAM guard: a file that cannot fit in half of the available memory is refused with a
+/// message naming the setting, and a machine that cannot report memory never fails a load.
+#[test]
+pub(crate) fn memory_guard_refuses_decodes_that_cannot_fit() {
+    set_memory_guard_enabled(true);
+    set_available_memory_for_tests(Some(2 * 1024 * 1024 * 1024)); // 2 GiB free
+
+    // 174 MP needs ~665 MiB + scratch, comfortably inside half of 2 GiB.
+    assert_eq!(memory_budget_error(10_835, 16_097), None);
+
+    // 600 MP needs ~2.2 GiB for RGBA alone: past the allowance and past the pixel ceiling too,
+    // so ask for one that only the memory check can reject.
+    let err = memory_budget_error(16_000, 16_000).expect("1 GiB RGBA does not fit in 1 GiB");
+    assert!(err.contains("Not enough free memory"), "{err}");
+    assert!(err.contains("Settings -> Performance"), "{err}");
+
+    // Unknown memory disables the guard rather than guessing.
+    set_available_memory_for_tests(None);
+    assert_eq!(memory_budget_error(16_000, 16_000), None);
+
+    // And the switch turns it off.
+    set_available_memory_for_tests(Some(512 * 1024 * 1024));
+    set_memory_guard_enabled(false);
+    assert_eq!(memory_budget_error(16_000, 16_000), None);
+
+    set_memory_guard_enabled(true);
+    set_available_memory_for_tests(None);
 }
 
 /// Rewrites a real PNG's IHDR dimensions: keeps the file readable by header probes while

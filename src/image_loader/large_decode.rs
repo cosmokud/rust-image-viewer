@@ -1,14 +1,16 @@
-//! The oversized-decode gate: one very large image decodes at a time.
+//! The oversized-decode gate: how many very large images decode at the same time.
 //!
 //! A 200 MP photo needs a ~800 MiB RGBA buffer, and masonry/thumbnail sweeps decode tiles on
-//! rayon workers in parallel. Two of those at once is a gigabyte of transient RAM on a machine
-//! that is also holding textures, so decodes whose header declares more than
-//! [`LARGE_DECODE_PIXELS`] take a single permit first. Everything at or below the threshold is
+//! rayon workers in parallel. Several of those at once is a gigabyte of transient RAM on a
+//! machine that is also holding textures, so decodes whose header declares more than
+//! [`LARGE_DECODE_PIXELS`] take a permit first. Everything at or below the threshold is
 //! untouched and stays fully parallel — the gate only exists for the handful of files that are
 //! expensive on their own.
 //!
+//! The permit count is the `parallel_large_decodes` setting (default 1, i.e. one at a time).
+//!
 //! The wait *yields* instead of parking. Decodes run inside `rayon::scope`, where the worker
-//! holding the permit is scheduled by the same pool: parking on a condvar here can deadlock the
+//! holding a permit is scheduled by the same pool: parking on a condvar here can deadlock the
 //! scope, while `rayon::yield_now()` lets that other worker run and finish its decode. The wait
 //! is also bounded: past [`LARGE_DECODE_WAIT`] the caller decodes anyway, because showing the
 //! picture slowly beats failing the tile.
@@ -27,8 +29,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use windows::{
@@ -46,34 +47,65 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
 
-/// Above this many pixels a decode takes the exclusive permit. It is the old fixed budget, so
-/// every image that loaded before the ceiling became configurable still loads exactly as fast.
-pub(crate) const LARGE_DECODE_PIXELS: u64 = 64 * 1_000_000;
+/// Above this many pixels a decode takes a permit. It is the old fixed budget, so every image
+/// that loaded before the ceiling became configurable still loads exactly as fast.
+pub(crate) const LARGE_DECODE_PIXELS: u64 = 64 * MEGAPIXEL;
 
-/// Longest a large decode waits for the permit before decoding anyway.
+/// Shipped default of `parallel_large_decodes`: one oversized decode at a time.
+pub(crate) const DEFAULT_PARALLEL_LARGE_DECODES: u8 = 1;
+
+/// Highest value the `parallel_large_decodes` setting accepts.
+pub(crate) const MAX_PARALLEL_LARGE_DECODES: u8 = 8;
+
+/// Longest a large decode waits for a permit before decoding anyway.
 pub(crate) const LARGE_DECODE_WAIT: Duration = Duration::from_secs(20);
 
 /// How long one yielded wait sleeps before retrying, when the caller is not a rayon worker.
 pub(crate) const LARGE_DECODE_POLL: Duration = Duration::from_millis(2);
 
-/// One exclusive slot for oversized decodes. Separate from the global instance so the behaviour
-/// is testable without racing every other decoding test in the same process.
+/// How many oversized decodes may run at once, published from the setting. An `AtomicU8` is
+/// enough for a value bounded by [`MAX_PARALLEL_LARGE_DECODES`] and stays a single byte in a hot
+/// path that every decode reads.
+static LARGE_DECODE_LIMIT: AtomicU8 = AtomicU8::new(DEFAULT_PARALLEL_LARGE_DECODES);
+
+/// Publishes how many oversized decodes may run at once. Zero is treated as one: the gate bounds
+/// a sweep, it does not forbid decoding. The shared gate is updated in place when it exists, so a
+/// lower value stops admitting new decodes immediately while running ones finish normally.
+pub fn set_parallel_large_decodes(permits: u8) {
+    let permits = permits.clamp(1, MAX_PARALLEL_LARGE_DECODES);
+    LARGE_DECODE_LIMIT.store(permits, Ordering::Release);
+    if let Some(gate) = LARGE_DECODE_GATE.get() {
+        gate.limit.store(permits, Ordering::Release);
+    }
+}
+
+pub fn parallel_large_decodes() -> u8 {
+    LARGE_DECODE_LIMIT.load(Ordering::Acquire).max(1)
+}
+
+/// One permit counter. Tests build their own so they do not race the process-wide gate.
 pub(crate) struct LargeDecodeGate {
-    busy: AtomicBool,
+    running: AtomicUsize,
+    limit: AtomicU8,
 }
 
 impl LargeDecodeGate {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(permits: u8) -> Self {
         Self {
-            busy: AtomicBool::new(false),
+            running: AtomicUsize::new(0),
+            limit: AtomicU8::new(permits.clamp(1, MAX_PARALLEL_LARGE_DECODES)),
         }
     }
 
-    /// Takes the slot for a header-declared size, yielding to rayon while another oversized
-    /// decode holds it. `None` for images at or below [`LARGE_DECODE_PIXELS`]: the common case
-    /// costs one comparison and never touches the atomic.
+    fn limit(&self) -> usize {
+        usize::from(self.limit.load(Ordering::Acquire).max(1))
+    }
+
+    /// Takes a permit for a header-declared size, yielding to rayon while every permit is held.
+    /// `None` for images at or below [`LARGE_DECODE_PIXELS`]: the common case costs one
+    /// comparison and never touches an atomic.
     pub(crate) fn permit_for(
-        self: &Arc<Self>,
+        self: &std::sync::Arc<Self>,
         width: u32,
         height: u32,
     ) -> Option<LargeDecodePermit> {
@@ -83,24 +115,20 @@ impl LargeDecodeGate {
 
         let started = Instant::now();
         loop {
-            if self
-                .busy
-                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-            {
+            if self.try_take() {
                 log_wait(started, true);
                 return Some(LargeDecodePermit {
-                    gate: Arc::clone(self),
+                    gate: std::sync::Arc::clone(self),
                     release: true,
                 });
             }
 
             if started.elapsed() >= LARGE_DECODE_WAIT {
-                // Decode without the slot rather than fail the load: the image is legitimate and
+                // Decode without a permit rather than fail the load: the image is legitimate and
                 // the worst case is a transient memory spike.
                 log_wait(started, false);
                 return Some(LargeDecodePermit {
-                    gate: Arc::clone(self),
+                    gate: std::sync::Arc::clone(self),
                     release: false,
                 });
             }
@@ -109,20 +137,39 @@ impl LargeDecodeGate {
         }
     }
 
+    fn try_take(&self) -> bool {
+        let limit = self.limit();
+        let mut current = self.running.load(Ordering::Acquire);
+        loop {
+            if current >= limit {
+                return false;
+            }
+            match self.running.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+
     #[cfg(test)]
-    pub(crate) fn is_free(&self) -> bool {
-        !self.busy.load(Ordering::Acquire)
+    pub(crate) fn running(&self) -> usize {
+        self.running.load(Ordering::Acquire)
     }
 }
 
-/// An exclusive permit for one oversized decode. Dropping it releases the gate.
+/// A held permit for one oversized decode. Dropping it returns the permit.
 pub(crate) struct LargeDecodePermit {
-    gate: Arc<LargeDecodeGate>,
+    gate: std::sync::Arc<LargeDecodeGate>,
     release: bool,
 }
 
 impl LargeDecodePermit {
-    /// Takes the process-wide gate for a header-declared size.
+    /// Takes a permit from the process-wide gate for a header-declared size.
     pub(crate) fn for_dimensions(width: u32, height: u32) -> Option<Self> {
         large_decode_gate().permit_for(width, height)
     }
@@ -131,20 +178,24 @@ impl LargeDecodePermit {
 impl Drop for LargeDecodePermit {
     fn drop(&mut self) {
         if self.release {
-            self.gate.busy.store(false, Ordering::Release);
+            self.gate.running.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
 
-/// `true` when a decode of `width`x`height` is expensive enough to serialize.
+/// `true` when a decode of `width`x`height` is expensive enough to be gated.
 pub(crate) fn needs_large_decode_permit(width: u32, height: u32) -> bool {
     (width as u64).saturating_mul(height as u64) > LARGE_DECODE_PIXELS
 }
 
-static LARGE_DECODE_GATE: std::sync::OnceLock<Arc<LargeDecodeGate>> = std::sync::OnceLock::new();
+/// The process-wide gate. Its limit is read from the setting on every take, so a change applies
+/// to the next oversized decode without rebuilding anything.
+static LARGE_DECODE_GATE: std::sync::OnceLock<std::sync::Arc<LargeDecodeGate>> =
+    std::sync::OnceLock::new();
 
-fn large_decode_gate() -> &'static Arc<LargeDecodeGate> {
-    LARGE_DECODE_GATE.get_or_init(|| Arc::new(LargeDecodeGate::new()))
+fn large_decode_gate() -> &'static std::sync::Arc<LargeDecodeGate> {
+    LARGE_DECODE_GATE
+        .get_or_init(|| std::sync::Arc::new(LargeDecodeGate::new(parallel_large_decodes())))
 }
 
 /// Hand the CPU to another rayon task when we are a worker (the permit holder is very likely

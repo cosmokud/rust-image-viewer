@@ -93,6 +93,8 @@ impl Config {
             metadata_cache_max_size_mb: 1024,
             masonry_metadata_ram_cache_limit_mb: 2048,
             max_decode_megapixels: 256,
+            parallel_large_decodes: 1,
+            decode_memory_guard: true,
             // Image quality defaults
             downscale_filter: ImageFilter::Lanczos3,
             gif_resize_filter: ImageFilter::Triangle,

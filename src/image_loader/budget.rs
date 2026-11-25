@@ -117,7 +117,10 @@ pub(crate) fn decode_budget_error(width: u32, height: u32) -> Option<String> {
             pixels.saturating_mul(4) / (1024 * 1024)
         ));
     }
-    None
+
+    // The pixel ceiling says "this file is allowed"; only the RAM check can say "this machine
+    // can hold it". Checked second so a file above the ceiling reports the ceiling, not memory.
+    memory_budget_error(width, height)
 }
 
 /// Header-derived `max_alloc`, clamped into `[MIN, ceiling]` so neither a tiny nor a lying header

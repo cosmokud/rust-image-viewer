@@ -79,7 +79,7 @@ mod tests {
 
     #[test]
     pub(crate) fn registry_covers_every_tab() {
-        assert_eq!(SETTINGS.len(), 142);
+        assert_eq!(SETTINGS.len(), 144);
         for (tab, expected) in [
             (SettingsTab::General, 5),
             (SettingsTab::Appearance, 2),
@@ -89,7 +89,7 @@ mod tests {
             (SettingsTab::Window, 11),
             (SettingsTab::Files, 6),
             (SettingsTab::Video, 11),
-            (SettingsTab::Performance, 15),
+            (SettingsTab::Performance, 17),
             (SettingsTab::Shortcuts, 65),
         ] {
             assert_eq!(tab_count(tab), expected, "{tab:?}");
@@ -321,6 +321,8 @@ mod tests {
                 "masonry_items_per_row" => Some(AppConsequence::MasonryItemsPerRow),
                 "video_alpha_opaque_fallback" => Some(AppConsequence::AlphaOpaqueFallback),
                 "max_decode_megapixels" => Some(AppConsequence::DecodeMegapixels),
+                "parallel_large_decodes" => Some(AppConsequence::ParallelLargeDecodes),
+                "decode_memory_guard" => Some(AppConsequence::DecodeMemoryGuard),
                 _ => None,
             };
             assert_eq!(app_consequence(setting.id), expected, "{}", setting.key);

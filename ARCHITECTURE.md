@@ -649,9 +649,12 @@ fallback (`image_decode.rs`). Techniques:
   setting (default 256 MP, counted in decimal megapixels) published into an atomic, plus
   `MIN_DECODE_ALLOC_BYTES = 256 MiB` and `DEFAULT_MAX_DECODE_ALLOC_BYTES = 4 GiB`. The RGBA
   ceiling is `4 x ceiling + 128 MiB` of decoder scratch,
-- `large_decode.rs`: decodes whose header declares more than 64 MP take a one-at-a-time permit
-  that yields to rayon (never parks, bounded wait) so a masonry sweep cannot hold several
-  gigabyte-sized frames at once,
+- `memory_budget.rs`: one `GlobalMemoryStatusEx` before an oversized decode; a file that needs
+  more than half of the available physical memory is refused with a message naming the
+  setting instead of thrashing the pagefile. Disabled where the platform cannot report it,
+- `large_decode.rs`: decodes whose header declares more than 64 MP take a permit
+  (`parallel_large_decodes`, default 1) that yields to rayon (never parks, bounded wait) so
+  a masonry sweep cannot hold several gigabyte-sized frames at once,
 - `fast_image_resize` for the hot resize, `image::imageops::resize` only when FIR rejects the
   buffer (`src/image_resize.rs`),
 - natural sort of directory entries (`sorting.rs`), `.lnk`-to-folder resolution

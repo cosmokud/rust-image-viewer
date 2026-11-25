@@ -17,7 +17,7 @@ use std::path::PathBuf;
 /// The table is per section, and a spelling may appear in more than one section only when it
 /// must route to a different key there: `[Settings] controls_hide_delay` is the controls
 /// delay, `[Video] controls_hide_delay` is the legacy name for the bottom overlay delay.
-pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 71] = [
+pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 73] = [
     (
         IniSection::Settings,
         &["controls_hide_delay"],
@@ -492,6 +492,20 @@ pub(crate) const INI_ALIASES: [(IniSection, &[&str], &str); 71] = [
             "max_image_megapixels",
         ],
         "max_decode_megapixels",
+    ),
+    (
+        IniSection::Performance,
+        &[
+            "parallel_large_decodes",
+            "parallel_large_decodes_at_once",
+            "large_decode_concurrency",
+        ],
+        "parallel_large_decodes",
+    ),
+    (
+        IniSection::Performance,
+        &["decode_memory_guard", "memory_guard", "decode_ram_check"],
+        "decode_memory_guard",
     ),
     (
         IniSection::Performance,

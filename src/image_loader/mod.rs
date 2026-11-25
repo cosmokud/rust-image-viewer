@@ -7,6 +7,7 @@
 //! | --- | --- |
 //! | Decode allocation budget | [`budget`] |
 //! | Oversized-decode gate | [`large_decode`] |
+//! | Available-RAM guard | [`memory_budget`] |
 //! | Extension sets and decode constants | [`constants`] |
 //! | Reader abstraction over files | [`reader`] |
 //! | Static decode, `zune-image` vs `image` crate | [`zune`], [`image_decode`], [`decode_static`] |
@@ -35,6 +36,7 @@ pub(crate) mod image_decode;
 pub(crate) mod large_decode;
 pub(crate) mod load;
 pub(crate) mod loaded;
+pub(crate) mod memory_budget;
 pub(crate) mod probe;
 pub(crate) mod reader;
 pub(crate) mod rotate;
@@ -61,6 +63,7 @@ pub(crate) use image_decode::*;
 pub(crate) use large_decode::*;
 pub(crate) use load::*;
 pub(crate) use loaded::*;
+pub(crate) use memory_budget::*;
 pub(crate) use probe::*;
 pub(crate) use reader::*;
 pub(crate) use rotate::*;

@@ -960,6 +960,8 @@ pub(crate) fn apply_decoder_preferences_from_config(config: &Config) {
     crate::video_player::set_alpha_opaque_fallback_enabled(config.video_alpha_opaque_fallback);
     // The still-image decode ceiling is read by worker threads that never see `&Config`.
     crate::image_loader::set_max_decode_megapixels(config.max_decode_megapixels);
+    crate::image_loader::set_parallel_large_decodes(config.parallel_large_decodes);
+    crate::image_loader::set_memory_guard_enabled(config.decode_memory_guard);
     let hardware_available = detect_video_acceleration_capabilities().hardware_decode_available;
     if !config.use_hardware_acceleration || !hardware_available {
         crate::video_player::apply_decoder_preference_windows(false, true, false, false);

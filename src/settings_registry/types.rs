@@ -70,6 +70,8 @@ pub enum AppConsequence {
     MasonryItemsPerRow,
     AlphaOpaqueFallback,
     DecodeMegapixels,
+    ParallelLargeDecodes,
+    DecodeMemoryGuard,
 }
 
 /// `Text` carries the raw INI string for `Rgb`/`Key`/`Modifier`/`Binding`/`BindingList`
