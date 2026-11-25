@@ -191,6 +191,7 @@ pub(crate) fn value_of(config: &Config, id: usize) -> SettingValue {
         138 => SettingValue::Bool(config.show_loading_spinners),
         139 => SettingValue::Bool(config.video_alpha_opaque_fallback),
         140 => SettingValue::Bool(config.floating_mode_remember_position),
+        141 => SettingValue::Num(config.max_decode_megapixels as f64),
         _ => SettingValue::Num(0.0),
     }
 }
@@ -261,6 +262,7 @@ pub(crate) fn set_num_field(config: &mut Config, id: usize, value: f64) {
         48 => config.masonry_items_per_row = value as usize,
         61 => config.show_fps_update_interval_ms = value as u64,
         72 => config.manga_mipmap_min_side = value as u32,
+        141 => config.max_decode_megapixels = value as u64,
         _ => {}
     }
 }

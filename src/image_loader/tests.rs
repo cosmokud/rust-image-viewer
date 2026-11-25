@@ -6,8 +6,10 @@
 use super::*;
 
 use super::{
-    decode_alloc_budget, decode_budget_error, get_media_in_directory, static_zune_decoder_options,
-    LoadedImage, MAX_DECODED_PIXELS, MAX_DECODED_RGBA_BYTES,
+    clamp_decoded_pixels, decode_alloc_budget, decode_budget_error, get_media_in_directory,
+    max_decoded_pixels, max_decoded_rgba_bytes, needs_large_decode_permit, set_max_decoded_pixels,
+    static_zune_decoder_options, LargeDecodeGate, LoadedImage, ABSOLUTE_MAX_DECODED_PIXELS,
+    DEFAULT_MAX_DECODED_PIXELS, MEGAPIXEL,
 };
 use image::imageops::FilterType;
 use std::fs;
@@ -37,21 +39,103 @@ pub(crate) fn unique_temp_dir(prefix: &str) -> PathBuf {
 
 #[test]
 pub(crate) fn decode_budget_rejects_bomb_dimensions_before_allocating() {
-    // 20000x20000 = 400 MP = 1.6 GiB RGBA: the exact shape the diag log crashed on.
+    // Tests share the process-wide ceiling, so each one starts from the shipped default.
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
+
+    // 20000x20000 = 400 MP = 1.5 GiB RGBA: the exact shape the diag log crashed on.
     let err = decode_budget_error(20_000, 20_000).expect("bomb dims must be rejected");
     assert!(err.contains("too large"), "unexpected error: {err}");
+    assert!(
+        err.contains("Settings -> Performance"),
+        "the error must point at the setting: {err}"
+    );
     assert_eq!(
-        decode_budget_error(8_192, 8_192),
+        decode_budget_error(16_000, 16_000),
         None,
-        "64 MP is still allowed"
+        "256 MP is the default ceiling"
     );
     assert!(
-        decode_budget_error(8_193, 8_192).is_some(),
-        "above 64 MP is not"
+        decode_budget_error(16_000, 16_001).is_some(),
+        "above the ceiling is not"
     );
     // Header-derived alloc budget can never exceed the fixed ceiling.
-    assert!(decode_alloc_budget(20_000, 20_000) <= MAX_DECODED_RGBA_BYTES);
+    assert!(decode_alloc_budget(20_000, 20_000) <= max_decoded_rgba_bytes());
     assert!(decode_alloc_budget(1, 1) >= 256 * 1024 * 1024);
+}
+
+/// The configured ceiling drives every budget check, and a value out of the setting's own range
+/// is clamped where it is published — a corrupt preset cannot unlock unlimited decoding.
+#[test]
+pub(crate) fn decode_budget_follows_the_configured_megapixel_ceiling() {
+    // The ceiling is process-wide, so this test restores it instead of reading it: whatever a
+    // sibling test left behind must not decide what this one asserts.
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
+
+    set_max_decoded_pixels(64 * MEGAPIXEL);
+    assert!(
+        decode_budget_error(20_000, 20_000).is_some(),
+        "400 MP > 64 MP"
+    );
+    assert_eq!(decode_budget_error(8_192, 7_812), None, "64 MP is allowed");
+    assert!(decode_alloc_budget(8_192, 7_812) <= max_decoded_rgba_bytes());
+
+    set_max_decoded_pixels(200 * MEGAPIXEL);
+    // The reporter's file (14204x10652 = 151 MP) and the 174 MP sample both fit under 200 MP.
+    for (width, height) in [(14_204, 10_652), (10_835, 16_097)] {
+        assert_eq!(
+            decode_budget_error(width, height),
+            None,
+            "{width}x{height} must fit a 200 MP limit"
+        );
+    }
+    assert!(
+        decode_budget_error(14_205, 14_080).is_some(),
+        "200 MP is the boundary, not a suggestion"
+    );
+
+    // Out-of-range values are clamped to the absolute ceiling instead of trusted.
+    assert_eq!(clamp_decoded_pixels(u64::MAX), ABSOLUTE_MAX_DECODED_PIXELS);
+    assert_eq!(clamp_decoded_pixels(0), 1);
+    assert_eq!(clamp_decoded_pixels(256 * MEGAPIXEL), 256 * MEGAPIXEL);
+
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
+    assert_eq!(max_decoded_pixels(), DEFAULT_MAX_DECODED_PIXELS);
+}
+
+/// The oversized-decode gate must be a no-op for ordinary photos and exclusive above the
+/// threshold, so a masonry sweep cannot hold two 800 MiB frames at once.
+#[test]
+pub(crate) fn large_decode_gate_only_covers_oversized_images() {
+    use std::sync::Arc;
+
+    assert!(
+        !needs_large_decode_permit(8_000, 8_000),
+        "64 MP is not gated"
+    );
+    assert!(
+        needs_large_decode_permit(8_192, 8_192),
+        "67 MP is above the gate"
+    );
+    assert!(needs_large_decode_permit(10_835, 16_097), "174 MP is gated");
+
+    let gate = Arc::new(LargeDecodeGate::new());
+    assert!(
+        gate.permit_for(1_000, 1_000).is_none(),
+        "ordinary sizes never touch the slot"
+    );
+    assert!(gate.is_free());
+
+    let held = gate.permit_for(16_000, 16_000).expect("256 MP is gated");
+    assert!(!gate.is_free(), "the first holder owns the slot");
+    drop(held);
+    assert!(gate.is_free(), "dropping the permit frees the slot");
+
+    // A permit taken in the same process can be re-acquired after release, which is what makes
+    // the next oversized file in a folder load at all.
+    let again = gate.permit_for(10_835, 16_097).expect("174 MP is gated");
+    assert!(!gate.is_free());
+    drop(again);
+    assert!(gate.is_free());
 }
 
 /// Rewrites a real PNG's IHDR dimensions: keeps the file readable by header probes while
@@ -265,8 +349,10 @@ pub(crate) fn gif_with_no_readable_frame_is_an_error() {
 
 #[test]
 pub(crate) fn constants_stay_consistent() {
-    assert_eq!(MAX_DECODED_PIXELS * 4, 256 * 1024 * 1024);
-    assert!(MAX_DECODED_RGBA_BYTES > MAX_DECODED_PIXELS * 4);
+    assert_eq!(DEFAULT_MAX_DECODED_PIXELS, 256 * MEGAPIXEL);
+    assert!(ABSOLUTE_MAX_DECODED_PIXELS > DEFAULT_MAX_DECODED_PIXELS);
+    set_max_decoded_pixels(DEFAULT_MAX_DECODED_PIXELS);
+    assert!(max_decoded_rgba_bytes() > DEFAULT_MAX_DECODED_PIXELS * 4);
 }
 
 #[test]
@@ -285,8 +371,10 @@ pub(crate) fn get_media_in_directory_includes_symlinked_folders() {
             if matches!(
                 err.kind(),
                 std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::Unsupported
-            ) =>
+            ) || err.raw_os_error() == Some(1314) =>
         {
+            // ERROR_PRIVILEGE_NOT_HELD: symbolic links need Developer Mode or an elevated
+            // process on Windows, so an unelevated checkout skips instead of failing.
             let _ = fs::remove_dir_all(&root);
             return;
         }
@@ -333,6 +421,66 @@ pub(crate) fn downscaled_static_load_keeps_source_display_dimensions() {
 
     assert_eq!((frame.width, frame.height), (13, 20));
     assert_eq!(loaded.display_dimensions(), (40, 60));
+
+    let _ = fs::remove_dir_all(&root);
+}
+
+/// End-to-end proof for the reported bug: a JPEG whose header declares more than the old fixed
+/// 64 MP ceiling must decode, not fall back to the placeholder.
+///
+/// A real 150-200 MP photo cannot live in the repo, so the file is generated here: a flat 8216 x
+/// 8216 (67.5 MP) JPEG is enough to cross the ceiling and still encodes in well under a second.
+#[test]
+pub(crate) fn oversized_jpeg_decodes_and_downscales() {
+    const SIDE: u32 = 8_216; // 67.5 MP: past the old 64 MP ceiling and past the gate threshold
+
+    let root = unique_temp_dir("image_loader_oversized_jpeg");
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join("oversized.jpg");
+
+    // zune-* is what the app itself decodes JPEG with; using its sibling encoder keeps the
+    // fixture honest (no new dev-dependency) and avoids re-materialising the pixel buffer.
+    {
+        use zune_core::colorspace::ColorSpace;
+        use zune_image::codecs::jpeg::JpegEncoder;
+        use zune_image::image::Image as ZuneImage;
+        use zune_image::traits::EncoderTrait;
+
+        let pixels = vec![130u8; (SIDE as usize) * (SIDE as usize) * 3];
+        let encoded_image =
+            ZuneImage::from_u8(&pixels, SIDE as usize, SIDE as usize, ColorSpace::RGB);
+        let mut out = Vec::new();
+        JpegEncoder::new()
+            .encode(&encoded_image, &mut out)
+            .expect("encode the fixture");
+        fs::write(&path, &out).unwrap();
+    }
+
+    assert_eq!(
+        probe_image_dimensions(&path),
+        Some((SIDE, SIDE)),
+        "the header must declare the oversized dimensions"
+    );
+
+    let loaded = LoadedImage::load_with_max_texture_side(
+        &path,
+        Some(1024),
+        FilterType::Triangle,
+        FilterType::Nearest,
+    )
+    .expect("a 67.5 MP JPEG is a normal photo, not a bomb");
+
+    let frame = loaded.current_frame_data();
+    assert_eq!(
+        loaded.display_dimensions(),
+        (SIDE, SIDE),
+        "the source dimensions drive the layout and the LOD buckets"
+    );
+    assert_eq!(frame.width.max(frame.height), 1024);
+    assert_eq!(
+        frame.pixels.len(),
+        (frame.width * frame.height * 4) as usize
+    );
 
     let _ = fs::remove_dir_all(&root);
 }

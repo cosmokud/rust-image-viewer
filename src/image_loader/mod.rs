@@ -6,6 +6,7 @@
 //! | Concern | Where |
 //! | --- | --- |
 //! | Decode allocation budget | [`budget`] |
+//! | Oversized-decode gate | [`large_decode`] |
 //! | Extension sets and decode constants | [`constants`] |
 //! | Reader abstraction over files | [`reader`] |
 //! | Static decode, `zune-image` vs `image` crate | [`zune`], [`image_decode`], [`decode_static`] |
@@ -31,6 +32,7 @@ pub(crate) mod display;
 pub(crate) mod extensions;
 pub(crate) mod gif_decode;
 pub(crate) mod image_decode;
+pub(crate) mod large_decode;
 pub(crate) mod load;
 pub(crate) mod loaded;
 pub(crate) mod probe;
@@ -56,6 +58,7 @@ pub(crate) use display::*;
 pub(crate) use extensions::*;
 pub(crate) use gif_decode::*;
 pub(crate) use image_decode::*;
+pub(crate) use large_decode::*;
 pub(crate) use load::*;
 pub(crate) use loaded::*;
 pub(crate) use probe::*;

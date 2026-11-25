@@ -75,6 +75,10 @@ pub(crate) fn decode_static_with_zune_limits(path: &Path) -> Result<(u32, u32, V
 
     let options = static_zune_decoder_options(path, max_alloc_usize, w, h);
 
+    // One oversized decode at a time: a 200 MP frame is most of a gigabyte, and masonry decodes
+    // tiles in parallel. The permit is held until the pixels are out.
+    let _large = LargeDecodePermit::for_dimensions(w, h);
+
     let reader = open_media_reader(path)?;
     let mut img = ZuneImage::read(reader, options)
         .map_err(|e| format!("Failed to load image with zune-image: {}", e))?;

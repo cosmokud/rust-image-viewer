@@ -1710,4 +1710,16 @@ pub const SETTINGS: &[Setting] = &[
         unused: false,
         action: None,
     },
+    Setting {
+        id: 141,
+        key: "max_decode_megapixels",
+        tab: SettingsTab::Performance,
+        label: "Max image decode megapixels",
+        group: "Image scaling",
+        help: "Largest still image the decoder will open, in megapixels (width x height / 1,000,000). Files above it show a \"too large to decode\" placeholder instead of loading. 256 MP (the default) opens 150-200 MP photos and panoramas using up to about 1 GiB of RAM per image; raise it for larger files, lower it to protect memory on smaller machines.",
+        kind: SettingKind::Int { min: 8, max: 1024 },
+        applies: Applies::Live,
+        unused: false,
+        action: None,
+    },
 ];

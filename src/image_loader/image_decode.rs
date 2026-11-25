@@ -64,6 +64,8 @@ pub(crate) fn decode_static_with_image_reader_limits(
     }
 
     reader.limits(limits);
+    // Same exclusive gate as the zune path; header dims are what the budget was sized from.
+    let _large = LargeDecodePermit::for_dimensions(w, h);
     let decoded = reader
         .decode()
         .map_err(|e| format!("Failed to load image: {}", e))?;

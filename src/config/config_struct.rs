@@ -194,6 +194,10 @@ pub struct Config {
     pub masonry_metadata_ram_cache_limit_mb: u64,
 
     // ============ PERFORMANCE SETTINGS ============
+    /// Ceiling, in megapixels, for one decoded still image. Files whose header declares more
+    /// than this are refused before the decoder allocates (the bomb guard). 256 MP keeps a
+    /// decoded RGBA frame under 1 GiB while allowing 150-200 MP photos and panoramas.
+    pub max_decode_megapixels: u64,
     /// Filter for downscaling images (making them smaller)
     pub downscale_filter: ImageFilter,
     /// Filter for GIF animation frame resizing (affects performance)

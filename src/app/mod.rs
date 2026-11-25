@@ -958,6 +958,8 @@ pub(crate) struct ImageViewer {
 pub(crate) fn apply_decoder_preferences_from_config(config: &Config) {
     // Not a decoder rank: the VP8/VP9-alpha fallback is read live by playback and thumbnails.
     crate::video_player::set_alpha_opaque_fallback_enabled(config.video_alpha_opaque_fallback);
+    // The still-image decode ceiling is read by worker threads that never see `&Config`.
+    crate::image_loader::set_max_decode_megapixels(config.max_decode_megapixels);
     let hardware_available = detect_video_acceleration_capabilities().hardware_decode_available;
     if !config.use_hardware_acceleration || !hardware_available {
         crate::video_player::apply_decoder_preference_windows(false, true, false, false);

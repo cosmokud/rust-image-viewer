@@ -73,6 +73,11 @@ impl ImageViewer {
                         self.config.video_alpha_opaque_fallback,
                     )
                 }
+                crate::settings_registry::AppConsequence::DecodeMegapixels => {
+                    crate::image_loader::set_max_decode_megapixels(
+                        self.config.max_decode_megapixels,
+                    )
+                }
             }
         }
     }

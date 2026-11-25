@@ -69,6 +69,7 @@ pub enum RowControl {
 pub enum AppConsequence {
     MasonryItemsPerRow,
     AlphaOpaqueFallback,
+    DecodeMegapixels,
 }
 
 /// `Text` carries the raw INI string for `Rgb`/`Key`/`Modifier`/`Binding`/`BindingList`

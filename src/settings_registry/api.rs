@@ -111,6 +111,7 @@ pub fn app_consequence(id: usize) -> Option<AppConsequence> {
     match id {
         48 => Some(AppConsequence::MasonryItemsPerRow),
         139 => Some(AppConsequence::AlphaOpaqueFallback),
+        141 => Some(AppConsequence::DecodeMegapixels),
         _ => None,
     }
 }
