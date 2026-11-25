@@ -1,5 +1,19 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `max_decode_megapixels` (Settings → Performance, "Image scaling", 8–1024, default **256**): the largest still image the decoder will open, counted in decimal megapixels. It replaces the fixed 64 MP ceiling that refused every 150–200 MP photo with "Image is too large to decode". The "too large" message now names the setting, and the value applies immediately — no restart.
+
+### Changed
+
+- Decodes whose header declares more than 64 MP run one at a time (a permit that yields to rayon instead of parking, with a bounded wait), so a Masonry or thumbnail sweep cannot hold several gigabyte-sized frames in memory at once.
+
+### Fixed
+
+- A 144 MP or 174 MP JPEG (and any PNG/WebP/TIFF above 64 MP) now opens and displays instead of falling back to the decode-error placeholder.
+
 ## [0.4.8] - 2026-11-25
 
 ### Changed

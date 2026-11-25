@@ -484,3 +484,56 @@ pub(crate) fn oversized_jpeg_decodes_and_downscales() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+/// Manual harness for the reporter's case, run against a *real* 150-200 MP file:
+/// `RIV_BIG_SAMPLE=<path> cargo test real_oversized_sample -- --ignored --nocapture`
+///
+/// The sample used while fixing this was a 10835 x 16097 (174 MP) baseline JPEG from Wikimedia
+/// Commons. It is not committed, so the test is `#[ignore]`d and skips silently without the env
+/// var.
+#[test]
+#[ignore]
+pub(crate) fn real_oversized_sample_loads() {
+    let Some(path) = std::env::var_os("RIV_BIG_SAMPLE").map(PathBuf::from) else {
+        eprintln!("RIV_BIG_SAMPLE not set; skipping");
+        return;
+    };
+
+    let (width, height) = probe_image_dimensions(&path).expect("header dims");
+    eprintln!(
+        "header: {width}x{height} = {:.1} MP",
+        (width as f64 * height as f64) / 1e6
+    );
+    assert_eq!(
+        decode_budget_error(width, height),
+        None,
+        "the sample must fit the default ceiling"
+    );
+
+    let started = std::time::Instant::now();
+    let loaded = LoadedImage::load_with_max_texture_side(
+        &path,
+        Some(8192),
+        FilterType::Lanczos3,
+        FilterType::Triangle,
+    )
+    .expect("a real 174 MP JPEG must load");
+    let elapsed = started.elapsed();
+
+    let frame = loaded.current_frame_data();
+    eprintln!(
+        "loaded in {:.2?}: source {}x{}, frame {}x{} ({} MiB)",
+        elapsed,
+        loaded.display_dimensions().0,
+        loaded.display_dimensions().1,
+        frame.width,
+        frame.height,
+        frame.pixels.len() / 1048576
+    );
+    assert_eq!(loaded.display_dimensions(), (width, height));
+    assert!(frame.width.max(frame.height) <= 8192);
+    assert_eq!(
+        frame.pixels.len(),
+        (frame.width * frame.height * 4) as usize
+    );
+}

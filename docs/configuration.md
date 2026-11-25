@@ -76,6 +76,7 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 
 | Key                             | Default    | Meaning                                                                           |
 | ------------------------------- | ---------- | --------------------------------------------------------------------------------- |
+| `max_decode_megapixels`         | `256`      | Largest still image the decoder opens, in megapixels (`width x height / 1,000,000`); raise for 150-200 MP panoramas, lower to cap RAM. |
 | `downscale_filter`              | `lanczos3` | CPU resize filter for shrinking images.                                           |
 | `gif_resize_filter`             | `triangle` | CPU resize filter for GIF frames.                                                 |
 | `texture_filter_static`         | `linear`   | GPU texture filtering for static images.                                          |
