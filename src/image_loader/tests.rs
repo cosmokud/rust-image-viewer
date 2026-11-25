@@ -7,9 +7,12 @@ use super::*;
 
 use super::{
     clamp_decoded_pixels, decode_alloc_budget, decode_budget_error, get_media_in_directory,
-    max_decoded_pixels, max_decoded_rgba_bytes, needs_large_decode_permit, set_max_decoded_pixels,
+    large_decode_threshold_pixels, max_decoded_pixels, max_decoded_rgba_bytes, memory_budget_error,
+    needs_large_decode_permit, set_available_memory_for_tests,
+    set_large_decode_threshold_megapixels, set_max_decoded_pixels, set_memory_guard_enabled,
     static_zune_decoder_options, LargeDecodeGate, LoadedImage, ABSOLUTE_MAX_DECODED_PIXELS,
-    DEFAULT_MAX_DECODED_PIXELS, MEGAPIXEL,
+    DEFAULT_LARGE_DECODE_THRESHOLD_MP, DEFAULT_MAX_DECODED_PIXELS, MAX_LARGE_DECODE_THRESHOLD_MP,
+    MEGAPIXEL,
 };
 use image::imageops::FilterType;
 use std::fs;
@@ -108,6 +111,11 @@ pub(crate) fn decode_budget_follows_the_configured_megapixel_ceiling() {
 pub(crate) fn large_decode_gate_only_covers_oversized_images() {
     use std::sync::Arc;
 
+    // Every assertion about the threshold runs against the shipped default, not whatever a
+    // sibling test left in the process-wide atomic.
+    set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
+    assert_eq!(large_decode_threshold_pixels(), 64 * MEGAPIXEL);
+
     assert!(
         !needs_large_decode_permit(8_000, 8_000),
         "64 MP is not gated"
@@ -117,6 +125,25 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
         "67 MP is above the gate"
     );
     assert!(needs_large_decode_permit(10_835, 16_097), "174 MP is gated");
+
+    // The threshold is the setting's value, clamped where it is published.
+    set_large_decode_threshold_megapixels(128);
+    assert!(
+        needs_large_decode_permit(10_835, 16_097),
+        "174 MP is over 128"
+    );
+    assert!(
+        !needs_large_decode_permit(8_192, 8_192),
+        "67 MP is under a 128 MP threshold"
+    );
+    set_large_decode_threshold_megapixels(0);
+    assert_eq!(large_decode_threshold_pixels(), 8 * MEGAPIXEL);
+    set_large_decode_threshold_megapixels(u32::MAX);
+    assert_eq!(
+        large_decode_threshold_pixels(),
+        u64::from(MAX_LARGE_DECODE_THRESHOLD_MP) * MEGAPIXEL
+    );
+    set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
 
     // Default: one permit, so a second oversized decode waits.
     let gate = Arc::new(LargeDecodeGate::new(1));
@@ -157,17 +184,30 @@ pub(crate) fn large_decode_gate_only_covers_oversized_images() {
 /// message naming the setting, and a machine that cannot report memory never fails a load.
 #[test]
 pub(crate) fn memory_guard_refuses_decodes_that_cannot_fit() {
+    set_large_decode_threshold_megapixels(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
     set_memory_guard_enabled(true);
     set_available_memory_for_tests(Some(2 * 1024 * 1024 * 1024)); // 2 GiB free
 
     // 174 MP needs ~665 MiB + scratch, comfortably inside half of 2 GiB.
     assert_eq!(memory_budget_error(10_835, 16_097), None);
 
-    // 600 MP needs ~2.2 GiB for RGBA alone: past the allowance and past the pixel ceiling too,
-    // so ask for one that only the memory check can reject.
+    // 256 MP needs ~1 GiB of RGBA against a 1 GiB allowance: past it.
     let err = memory_budget_error(16_000, 16_000).expect("1 GiB RGBA does not fit in 1 GiB");
     assert!(err.contains("Not enough free memory"), "{err}");
     assert!(err.contains("Settings -> Performance"), "{err}");
+
+    // Files at or below the threshold are never checked, however tight memory looks: a small
+    // decode is what the normal parallel path is for.
+    set_available_memory_for_tests(Some(64 * 1024 * 1024));
+    assert_eq!(memory_budget_error(4_000, 3_000), None);
+    assert_eq!(memory_budget_error(8_000, 8_000), None);
+    // Above the threshold the floor (`MIN_DECODE_ALLOWANCE_BYTES`) still applies, so a 67 MP file
+    // is admitted and a 100 MP one (~464 MiB) is not.
+    assert_eq!(memory_budget_error(8_192, 8_192), None);
+    assert!(
+        memory_budget_error(10_000, 10_000).is_some(),
+        "100 MP does not fit the allowance"
+    );
 
     // Unknown memory disables the guard rather than guessing.
     set_available_memory_for_tests(None);

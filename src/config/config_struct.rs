@@ -198,7 +198,10 @@ pub struct Config {
     /// than this are refused before the decoder allocates (the bomb guard). 256 MP keeps a
     /// decoded RGBA frame under 1 GiB while allowing 150-200 MP photos and panoramas.
     pub max_decode_megapixels: u64,
-    /// How many oversized (over 64 MP) images may decode at the same time. One keeps the peak
+    /// Images above this many megapixels count as large: the gate below limits them and their
+    /// cached textures are released before decoding.
+    pub large_decode_threshold_megapixels: u32,
+    /// How many oversized (over the threshold) images may decode at the same time. One keeps the peak
     /// bounded on a machine that is also holding textures and video frames.
     pub parallel_large_decodes: u8,
     /// Refuse a decode that cannot fit in half of the memory Windows reports as available,

@@ -110,10 +110,11 @@ pub fn apply_values(config: &mut Config, values: &[(usize, SettingValue)]) -> Ve
 pub fn app_consequence(id: usize) -> Option<AppConsequence> {
     match id {
         48 => Some(AppConsequence::MasonryItemsPerRow),
-        142 => Some(AppConsequence::AlphaOpaqueFallback),
+        143 => Some(AppConsequence::AlphaOpaqueFallback),
         66 => Some(AppConsequence::DecodeMegapixels),
-        67 => Some(AppConsequence::ParallelLargeDecodes),
-        68 => Some(AppConsequence::DecodeMemoryGuard),
+        67 => Some(AppConsequence::LargeDecodeThreshold),
+        68 => Some(AppConsequence::ParallelLargeDecodes),
+        69 => Some(AppConsequence::DecodeMemoryGuard),
         _ => None,
     }
 }

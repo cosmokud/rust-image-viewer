@@ -815,7 +815,7 @@ pub const SETTINGS: &[Setting] = &[
         key: "max_decode_megapixels",
         tab: SettingsTab::Performance,
         label: "Max image decode megapixels",
-        group: "Image scaling",
+        group: "Decode Limits",
         help: "Largest still image the decoder will open, in megapixels (width x height / 1,000,000). Files above it show a \"too large to decode\" placeholder instead of loading. 256 MP (the default) opens 150-200 MP photos and panoramas using up to about 1 GiB of RAM per image; raise it for larger files, lower it to protect memory on smaller machines.",
         kind: SettingKind::Int { min: 8, max: 1024 },
         applies: Applies::Live,
@@ -824,30 +824,42 @@ pub const SETTINGS: &[Setting] = &[
     },
     Setting {
         id: 67,
-        key: "parallel_large_decodes",
+        key: "large_decode_threshold_megapixels",
         tab: SettingsTab::Performance,
-        label: "Large image decodes at once",
-        group: "Image scaling",
-        help: "How many images larger than 64 MP may decode at the same time. 1 (the default) keeps the peak memory of a gallery or Long Strip sweep bounded, because each such file needs most of a gigabyte while it decodes. Raise it on a machine with plenty of RAM to fill a large grid faster.",
-        kind: SettingKind::Int { min: 1, max: 8 },
+        label: "Large decode threshold megapixels",
+        group: "Decode Limits",
+        help: "Images above this size count as large: they take the limited slots set by the row below and they are the ones checked against free RAM. 64 MP (the default) is where a full RGBA frame stops being cheap, roughly 256 MiB before the decoder overhead. Raise it to give more of the library the fully parallel path, lower it to bound memory on a smaller machine.",
+        kind: SettingKind::Int { min: 8, max: 256 },
         applies: Applies::Live,
         unused: false,
         action: None,
     },
     Setting {
         id: 68,
-        key: "decode_memory_guard",
+        key: "parallel_large_decodes",
         tab: SettingsTab::Performance,
-        label: "Refuse decodes that do not fit in RAM",
-        group: "Image scaling",
-        help: "Before allocating, compare the file's declared size with the memory Windows reports as available; if decoding it would need more than half of that, show the error instead of thrashing the pagefile. true (default) fails fast with a message naming the setting, false always attempts the decode.",
-        kind: SettingKind::Bool,
+        label: "Large image decodes at once",
+        group: "Decode Limits",
+        help: "How many images above the large decode threshold may decode at the same time. 1 (the default) keeps the peak memory of a gallery or Long Strip sweep bounded, because each such file needs most of a gigabyte while it decodes. Raise it on a machine with plenty of RAM to fill a large grid faster.",
+        kind: SettingKind::Int { min: 1, max: 8 },
         applies: Applies::Live,
         unused: false,
         action: None,
     },
     Setting {
         id: 69,
+        key: "decode_memory_guard",
+        tab: SettingsTab::Performance,
+        label: "Refuse decodes that do not fit in RAM",
+        group: "Decode Limits",
+        help: "Before allocating, compare the declared size with the memory Windows reports as available; if decoding would need more than half of that, show the error instead of thrashing the pagefile. true (default) fails fast with a message naming the row above, false always attempts the decode.",
+        kind: SettingKind::Bool,
+        applies: Applies::Live,
+        unused: false,
+        action: None,
+    },
+    Setting {
+        id: 70,
         key: "downscale_filter",
         tab: SettingsTab::Performance,
         label: "Downscale filter",
@@ -859,7 +871,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 70,
+        id: 71,
         key: "gif_resize_filter",
         tab: SettingsTab::Performance,
         label: "Gif resize filter",
@@ -871,7 +883,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 71,
+        id: 72,
         key: "texture_filter_static",
         tab: SettingsTab::Performance,
         label: "Texture filter static",
@@ -883,7 +895,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 72,
+        id: 73,
         key: "texture_filter_animated",
         tab: SettingsTab::Performance,
         label: "Texture filter animated",
@@ -895,7 +907,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 73,
+        id: 74,
         key: "texture_filter_video",
         tab: SettingsTab::Performance,
         label: "Texture filter video",
@@ -907,7 +919,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 74,
+        id: 75,
         key: "manga_mipmap_static",
         tab: SettingsTab::Performance,
         label: "Mipmap static",
@@ -919,7 +931,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 75,
+        id: 76,
         key: "manga_mipmap_video_thumbnails",
         tab: SettingsTab::Performance,
         label: "Mipmap video thumbnails",
@@ -931,7 +943,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 76,
+        id: 77,
         key: "manga_mipmap_min_side",
         tab: SettingsTab::Performance,
         label: "Mipmap min side",
@@ -943,7 +955,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 77,
+        id: 78,
         key: "toggle_fullscreen",
         tab: SettingsTab::Shortcuts,
         label: "Toggle fullscreen",
@@ -955,7 +967,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ToggleFullscreen),
     },
     Setting {
-        id: 78,
+        id: 79,
         key: "exit",
         tab: SettingsTab::Shortcuts,
         label: "Exit",
@@ -967,7 +979,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::Exit),
     },
     Setting {
-        id: 79,
+        id: 80,
         key: "pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -979,7 +991,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::Pan),
     },
     Setting {
-        id: 80,
+        id: 81,
         key: "select_area",
         tab: SettingsTab::Shortcuts,
         label: "Select area",
@@ -991,7 +1003,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::SelectArea),
     },
     Setting {
-        id: 81,
+        id: 82,
         key: "goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1003,7 +1015,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::GotoFile),
     },
     Setting {
-        id: 82,
+        id: 83,
         key: "freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1015,7 +1027,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FreehandAutoscroll),
     },
     Setting {
-        id: 83,
+        id: 84,
         key: "mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1027,7 +1039,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 84,
+        id: 85,
         key: "toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1039,7 +1051,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 85,
+        id: 86,
         key: "next_image",
         tab: SettingsTab::Shortcuts,
         label: "Next image",
@@ -1051,7 +1063,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::NextImage),
     },
     Setting {
-        id: 86,
+        id: 87,
         key: "previous_image",
         tab: SettingsTab::Shortcuts,
         label: "Previous image",
@@ -1063,7 +1075,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreviousImage),
     },
     Setting {
-        id: 87,
+        id: 88,
         key: "rotate_clockwise",
         tab: SettingsTab::Shortcuts,
         label: "Rotate clockwise",
@@ -1075,7 +1087,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::RotateClockwise),
     },
     Setting {
-        id: 88,
+        id: 89,
         key: "rotate_counterclockwise",
         tab: SettingsTab::Shortcuts,
         label: "Rotate counterclockwise",
@@ -1087,7 +1099,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::RotateCounterClockwise),
     },
     Setting {
-        id: 89,
+        id: 90,
         key: "precise_rotation_clockwise",
         tab: SettingsTab::Shortcuts,
         label: "Precise rotation clockwise",
@@ -1099,7 +1111,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreciseRotationClockwise),
     },
     Setting {
-        id: 90,
+        id: 91,
         key: "precise_rotation_counterclockwise",
         tab: SettingsTab::Shortcuts,
         label: "Precise rotation counterclockwise",
@@ -1111,7 +1123,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::PreciseRotationCounterClockwise),
     },
     Setting {
-        id: 91,
+        id: 92,
         key: "flip_vertically",
         tab: SettingsTab::Shortcuts,
         label: "Flip vertically",
@@ -1123,7 +1135,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FlipVertically),
     },
     Setting {
-        id: 92,
+        id: 93,
         key: "flip_horizontally",
         tab: SettingsTab::Shortcuts,
         label: "Flip horizontally",
@@ -1135,7 +1147,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::FlipHorizontally),
     },
     Setting {
-        id: 93,
+        id: 94,
         key: "zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1147,7 +1159,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ZoomIn),
     },
     Setting {
-        id: 94,
+        id: 95,
         key: "zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1159,7 +1171,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::ZoomOut),
     },
     Setting {
-        id: 95,
+        id: 96,
         key: "manga_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1171,7 +1183,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPan),
     },
     Setting {
-        id: 96,
+        id: 97,
         key: "manga_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1183,7 +1195,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaGotoFile),
     },
     Setting {
-        id: 97,
+        id: 98,
         key: "manga_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1195,7 +1207,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaFreehandAutoscroll),
     },
     Setting {
-        id: 98,
+        id: 99,
         key: "manga_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1207,7 +1219,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 99,
+        id: 100,
         key: "manga_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1219,7 +1231,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 100,
+        id: 101,
         key: "manga_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1231,7 +1243,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPanUp),
     },
     Setting {
-        id: 101,
+        id: 102,
         key: "manga_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1243,7 +1255,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPanDown),
     },
     Setting {
-        id: 102,
+        id: 103,
         key: "manga_next_image_fit",
         tab: SettingsTab::Shortcuts,
         label: "Next image fit",
@@ -1255,7 +1267,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaNextImageFit),
     },
     Setting {
-        id: 103,
+        id: 104,
         key: "manga_previous_image_fit",
         tab: SettingsTab::Shortcuts,
         label: "Previous image fit",
@@ -1267,7 +1279,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPreviousImageFit),
     },
     Setting {
-        id: 104,
+        id: 105,
         key: "manga_next_image",
         tab: SettingsTab::Shortcuts,
         label: "Next image",
@@ -1279,7 +1291,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaNextImage),
     },
     Setting {
-        id: 105,
+        id: 106,
         key: "manga_previous_image",
         tab: SettingsTab::Shortcuts,
         label: "Previous image",
@@ -1291,7 +1303,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaPreviousImage),
     },
     Setting {
-        id: 106,
+        id: 107,
         key: "manga_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1303,7 +1315,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaScrollUp),
     },
     Setting {
-        id: 107,
+        id: 108,
         key: "manga_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1315,7 +1327,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaScrollDown),
     },
     Setting {
-        id: 108,
+        id: 109,
         key: "manga_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1327,7 +1339,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaZoomIn),
     },
     Setting {
-        id: 109,
+        id: 110,
         key: "manga_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1339,7 +1351,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MangaZoomOut),
     },
     Setting {
-        id: 110,
+        id: 111,
         key: "masonry_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1351,7 +1363,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPan),
     },
     Setting {
-        id: 111,
+        id: 112,
         key: "masonry_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1363,7 +1375,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryGotoFile),
     },
     Setting {
-        id: 112,
+        id: 113,
         key: "masonry_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1375,7 +1387,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryFreehandAutoscroll),
     },
     Setting {
-        id: 113,
+        id: 114,
         key: "masonry_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1387,7 +1399,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 114,
+        id: 115,
         key: "masonry_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1399,7 +1411,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 115,
+        id: 116,
         key: "masonry_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1411,7 +1423,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp),
     },
     Setting {
-        id: 116,
+        id: 117,
         key: "masonry_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1423,7 +1435,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown),
     },
     Setting {
-        id: 117,
+        id: 118,
         key: "masonry_pan_up_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 2",
@@ -1435,7 +1447,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp2),
     },
     Setting {
-        id: 118,
+        id: 119,
         key: "masonry_pan_down_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 2",
@@ -1447,7 +1459,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown2),
     },
     Setting {
-        id: 119,
+        id: 120,
         key: "masonry_pan_up_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 3",
@@ -1459,7 +1471,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp3),
     },
     Setting {
-        id: 120,
+        id: 121,
         key: "masonry_pan_down_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 3",
@@ -1471,7 +1483,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown3),
     },
     Setting {
-        id: 121,
+        id: 122,
         key: "masonry_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1483,7 +1495,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollUp),
     },
     Setting {
-        id: 122,
+        id: 123,
         key: "masonry_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1495,7 +1507,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollDown),
     },
     Setting {
-        id: 123,
+        id: 124,
         key: "masonry_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1507,7 +1519,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomIn),
     },
     Setting {
-        id: 124,
+        id: 125,
         key: "masonry_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1519,7 +1531,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomOut),
     },
     Setting {
-        id: 125,
+        id: 126,
         key: "gallery_pan",
         tab: SettingsTab::Shortcuts,
         label: "Pan",
@@ -1531,7 +1543,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPan),
     },
     Setting {
-        id: 126,
+        id: 127,
         key: "gallery_goto_file",
         tab: SettingsTab::Shortcuts,
         label: "Goto file",
@@ -1543,7 +1555,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryGotoFile),
     },
     Setting {
-        id: 127,
+        id: 128,
         key: "gallery_freehand_autoscroll",
         tab: SettingsTab::Shortcuts,
         label: "Freehand autoscroll",
@@ -1555,7 +1567,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryFreehandAutoscroll),
     },
     Setting {
-        id: 128,
+        id: 129,
         key: "gallery_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Mark file",
@@ -1567,7 +1579,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 129,
+        id: 130,
         key: "gallery_toggle_mark_file",
         tab: SettingsTab::Shortcuts,
         label: "Toggle mark file",
@@ -1579,7 +1591,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 130,
+        id: 131,
         key: "gallery_pan_up",
         tab: SettingsTab::Shortcuts,
         label: "Pan up",
@@ -1591,7 +1603,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp),
     },
     Setting {
-        id: 131,
+        id: 132,
         key: "gallery_pan_down",
         tab: SettingsTab::Shortcuts,
         label: "Pan down",
@@ -1603,7 +1615,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown),
     },
     Setting {
-        id: 132,
+        id: 133,
         key: "gallery_pan_up_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 2",
@@ -1615,7 +1627,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp2),
     },
     Setting {
-        id: 133,
+        id: 134,
         key: "gallery_pan_down_2",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 2",
@@ -1627,7 +1639,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown2),
     },
     Setting {
-        id: 134,
+        id: 135,
         key: "gallery_pan_up_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan up 3",
@@ -1639,7 +1651,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanUp3),
     },
     Setting {
-        id: 135,
+        id: 136,
         key: "gallery_pan_down_3",
         tab: SettingsTab::Shortcuts,
         label: "Pan down 3",
@@ -1651,7 +1663,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryPanDown3),
     },
     Setting {
-        id: 136,
+        id: 137,
         key: "gallery_scroll_up",
         tab: SettingsTab::Shortcuts,
         label: "Scroll up",
@@ -1663,7 +1675,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollUp),
     },
     Setting {
-        id: 137,
+        id: 138,
         key: "gallery_scroll_down",
         tab: SettingsTab::Shortcuts,
         label: "Scroll down",
@@ -1675,7 +1687,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryScrollDown),
     },
     Setting {
-        id: 138,
+        id: 139,
         key: "gallery_zoom_in",
         tab: SettingsTab::Shortcuts,
         label: "Zoom in",
@@ -1687,7 +1699,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomIn),
     },
     Setting {
-        id: 139,
+        id: 140,
         key: "gallery_zoom_out",
         tab: SettingsTab::Shortcuts,
         label: "Zoom out",
@@ -1699,7 +1711,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::MasonryZoomOut),
     },
     Setting {
-        id: 140,
+        id: 141,
         key: "video_play_pause",
         tab: SettingsTab::Shortcuts,
         label: "Video play pause",
@@ -1711,7 +1723,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::VideoPlayPause),
     },
     Setting {
-        id: 141,
+        id: 142,
         key: "video_mute",
         tab: SettingsTab::Shortcuts,
         label: "Video mute",
@@ -1723,7 +1735,7 @@ pub const SETTINGS: &[Setting] = &[
         action: Some(Action::VideoMute),
     },
     Setting {
-        id: 142,
+        id: 143,
         key: "video_alpha_opaque_fallback",
         tab: SettingsTab::Video,
         label: "Opaque fallback for alpha video",
@@ -1735,7 +1747,7 @@ pub const SETTINGS: &[Setting] = &[
         action: None,
     },
     Setting {
-        id: 143,
+        id: 144,
         key: "floating_mode_remember_position",
         tab: SettingsTab::Window,
         label: "Remember floating window",

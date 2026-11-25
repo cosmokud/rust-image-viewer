@@ -72,13 +72,21 @@ The config file is at `%APPDATA%\rust-image-viewer\config.ini` on Windows. Delet
 | `enable_d3d12`                | `true`  | Prefer D3D12 decoders (falls back to D3D11).              |
 | `enable_cuda`                 | `true`  | Enable CUDA decoder preference where supported.           |
 
-## Quality
+## Decode limits
+
+The Decode Limits card in Settings -> Performance owns these four keys.
 
 | Key                             | Default    | Meaning                                                                           |
 | ------------------------------- | ---------- | --------------------------------------------------------------------------------- |
 | `max_decode_megapixels`         | `256`      | Largest still image the decoder opens, in megapixels (`width x height / 1,000,000`); raise for 150-200 MP panoramas, lower to cap RAM. |
-| `parallel_large_decodes`        | `1`        | How many images over 64 MP may decode at once. 1 bounds the peak memory of a gallery sweep; raise on a big-RAM machine. |
+| `large_decode_threshold_megapixels` | `64`   | Images above this size count as large: they take the limited slots below and are the ones checked against free RAM. |
+| `parallel_large_decodes`        | `1`        | How many images above the threshold may decode at once. 1 bounds the peak memory of a gallery sweep; raise on a big-RAM machine. |
 | `decode_memory_guard`           | `true`     | Refuse a decode that needs more than half of the memory Windows reports as available, instead of thrashing the pagefile. |
+
+## Quality
+
+| Key                             | Default    | Meaning                                                                           |
+| ------------------------------- | ---------- | --------------------------------------------------------------------------------- |
 | `downscale_filter`              | `lanczos3` | CPU resize filter for shrinking images.                                           |
 | `gif_resize_filter`             | `triangle` | CPU resize filter for GIF frames.                                                 |
 | `texture_filter_static`         | `linear`   | GPU texture filtering for static images.                                          |

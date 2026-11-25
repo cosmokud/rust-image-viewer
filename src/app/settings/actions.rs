@@ -78,6 +78,11 @@ impl ImageViewer {
                         self.config.max_decode_megapixels,
                     )
                 }
+                crate::settings_registry::AppConsequence::LargeDecodeThreshold => {
+                    crate::image_loader::set_large_decode_threshold_megapixels(
+                        self.config.large_decode_threshold_megapixels,
+                    )
+                }
                 crate::settings_registry::AppConsequence::ParallelLargeDecodes => {
                     crate::image_loader::set_parallel_large_decodes(
                         self.config.parallel_large_decodes,

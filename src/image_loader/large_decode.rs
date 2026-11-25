@@ -3,7 +3,7 @@
 //! A 200 MP photo needs a ~800 MiB RGBA buffer, and masonry/thumbnail sweeps decode tiles on
 //! rayon workers in parallel. Several of those at once is a gigabyte of transient RAM on a
 //! machine that is also holding textures, so decodes whose header declares more than
-//! [`LARGE_DECODE_PIXELS`] take a permit first. Everything at or below the threshold is
+//! the large decode threshold take a permit first. Everything at or below the threshold is
 //! untouched and stays fully parallel — the gate only exists for the handful of files that are
 //! expensive on their own.
 //!
@@ -29,7 +29,7 @@ use std::io::{BufRead, BufReader, Cursor, Read, Seek};
 #[cfg(target_os = "windows")]
 use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 #[cfg(target_os = "windows")]
 use windows::{
@@ -47,9 +47,35 @@ use zune_core::colorspace::ColorSpace;
 use zune_core::options::DecoderOptions;
 use zune_image::image::Image as ZuneImage;
 
-/// Above this many pixels a decode takes a permit. It is the old fixed budget, so every image
-/// that loaded before the ceiling became configurable still loads exactly as fast.
-pub(crate) const LARGE_DECODE_PIXELS: u64 = 64 * MEGAPIXEL;
+/// Shipped default of the `large_decode_threshold_megapixels` setting: the old fixed budget, so
+/// every image that loaded before it became configurable still loads exactly as fast.
+pub(crate) const DEFAULT_LARGE_DECODE_THRESHOLD_MP: u32 = 64;
+
+/// Registry range of `large_decode_threshold_megapixels`.
+pub(crate) const MIN_LARGE_DECODE_THRESHOLD_MP: u32 = 8;
+
+pub(crate) const MAX_LARGE_DECODE_THRESHOLD_MP: u32 = 256;
+
+/// The live `large_decode_threshold_megapixels` value, in decimal megapixels.
+static LARGE_DECODE_THRESHOLD_MP: AtomicU32 = AtomicU32::new(DEFAULT_LARGE_DECODE_THRESHOLD_MP);
+
+/// Publishes the threshold above which a decode is gated. Clamped to the setting's own range so a
+/// corrupt preset cannot gate every file (or none).
+pub fn set_large_decode_threshold_megapixels(megapixels: u32) {
+    LARGE_DECODE_THRESHOLD_MP.store(
+        megapixels.clamp(MIN_LARGE_DECODE_THRESHOLD_MP, MAX_LARGE_DECODE_THRESHOLD_MP),
+        Ordering::Release,
+    );
+}
+
+pub fn large_decode_threshold_megapixels() -> u32 {
+    LARGE_DECODE_THRESHOLD_MP.load(Ordering::Acquire)
+}
+
+/// The threshold in pixels, which is what the header check compares against.
+pub(crate) fn large_decode_threshold_pixels() -> u64 {
+    u64::from(large_decode_threshold_megapixels()).saturating_mul(MEGAPIXEL)
+}
 
 /// Shipped default of `parallel_large_decodes`: one oversized decode at a time.
 pub(crate) const DEFAULT_PARALLEL_LARGE_DECODES: u8 = 1;
@@ -102,7 +128,7 @@ impl LargeDecodeGate {
     }
 
     /// Takes a permit for a header-declared size, yielding to rayon while every permit is held.
-    /// `None` for images at or below [`LARGE_DECODE_PIXELS`]: the common case costs one
+    /// `None` for images at or below the threshold: the common case costs one
     /// comparison and never touches an atomic.
     pub(crate) fn permit_for(
         self: &std::sync::Arc<Self>,
@@ -185,7 +211,7 @@ impl Drop for LargeDecodePermit {
 
 /// `true` when a decode of `width`x`height` is expensive enough to be gated.
 pub(crate) fn needs_large_decode_permit(width: u32, height: u32) -> bool {
-    (width as u64).saturating_mul(height as u64) > LARGE_DECODE_PIXELS
+    (width as u64).saturating_mul(height as u64) > large_decode_threshold_pixels()
 }
 
 /// The process-wide gate. Its limit is read from the setting on every take, so a change applies

@@ -71,6 +71,7 @@ pub enum AppConsequence {
     AlphaOpaqueFallback,
     DecodeMegapixels,
     ParallelLargeDecodes,
+    LargeDecodeThreshold,
     DecodeMemoryGuard,
 }
 

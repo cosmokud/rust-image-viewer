@@ -56,7 +56,6 @@ static AVAILABLE_PHYSICAL: AtomicU64 = AtomicU64::new(u64::MAX);
 
 /// Test hook: pin the available-memory figure so a budget test does not depend on the machine it
 /// runs on. `None` restores the real query.
-#[cfg(test)]
 pub(crate) fn set_available_memory_for_tests(bytes: Option<u64>) {
     AVAILABLE_PHYSICAL_OVERRIDE.store(bytes.unwrap_or(u64::MAX), Ordering::Release);
 }
@@ -99,10 +98,13 @@ pub(crate) fn estimated_decode_bytes(width: u32, height: u32) -> u64 {
 }
 
 /// Error when the decode cannot fit in available RAM. `None` when it can, when the platform does
-/// not report memory, or when the figure is stale — the guard must never be the only reason a
+/// not report memory, or when the file is below the large-decode threshold: small files are what
+/// the normal parallel path is for, and gating them behind a RAM reading would turn a transient
+/// dip on a busy machine into a failed thumbnail. The guard is for the gigabyte-sized decodes,
+/// which are exactly the ones the threshold marks — the guard must never be the only reason a
 /// legitimate file fails to open.
 pub(crate) fn memory_budget_error(width: u32, height: u32) -> Option<String> {
-    if !memory_guard_enabled() {
+    if !memory_guard_enabled() || !needs_large_decode_permit(width, height) {
         return None;
     }
     let available = available_physical_bytes()?;
@@ -115,8 +117,8 @@ pub(crate) fn memory_budget_error(width: u32, height: u32) -> Option<String> {
 
     Some(format!(
         "Not enough free memory to decode: {}x{} needs about {} MiB but only {} MiB of the \
-         {} MiB available can be used. Close something, or lower \"Max image decode megapixels\" \
-         in Settings -> Performance.",
+         {} MiB available can be used. Close something, or raise \"Large decode threshold\" \
+         in Settings -> Performance to stop checking files this size.",
         width,
         height,
         needed / (1024 * 1024),
