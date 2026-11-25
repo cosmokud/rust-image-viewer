@@ -1739,3 +1739,316 @@ pub(crate) fn manga_upload_catchup_gates_when_strip_focused_video_plays() {
     assert!(!viewer.manga_should_catchup_uploads_with_playback(false, true, 2));
     assert!(!viewer.manga_should_fast_poll_background(false, 0, 0));
 }
+
+#[test]
+pub(crate) fn upload_byte_budgets_large_caps_no_midscroll_upgrades_and_frame_backoff() {
+    let mib = 1024 * 1024;
+    let mut viewer = long_strip_scroll_test_viewer(6);
+    viewer.screen_size = egui::vec2(1000.0, 700.0);
+    viewer.manga_scroll_offset = 100.0;
+    viewer.manga_scroll_target = 100.0;
+    viewer.config.use_hardware_acceleration = true;
+    viewer.config.manga_mipmap_static = true;
+    viewer.config.manga_mipmap_min_side = 128;
+    viewer.max_texture_side = 2048;
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for idx in 0..6 {
+            loader
+                .dimension_cache
+                .insert(idx, (1000, 1500, MangaMediaType::StaticImage));
+        }
+    }
+
+    // 1) Byte budget scaling across 60 / 144 / 200 Hz.
+    viewer.fps_display_refresh_hz = Some(144.0);
+    assert!((viewer.manga_upload_byte_budget(true) as f32 - 6.944 * mib as f32).abs() < 64_000.0);
+    assert!((viewer.manga_upload_byte_budget(false) as f32 - 11.111 * mib as f32).abs() < 64_000.0);
+    viewer.fps_display_refresh_hz = Some(200.0);
+    assert_eq!(viewer.manga_upload_byte_budget(true), 5 * mib);
+    assert_eq!(viewer.manga_upload_byte_budget(false), 8 * mib);
+    viewer.fps_display_refresh_hz = Some(60.0);
+    assert_eq!(viewer.manga_upload_byte_budget(true), 14 * mib);
+    assert_eq!(viewer.manga_upload_byte_budget(false), 24 * mib);
+
+    // 2) Active scrolling caps >2 MiB uploads to at most 1 blank visible tile per frame,
+    // even if that single tile exceeds the byte budget (e.g. 7.68 MiB > 6.94 MiB @ 144Hz),
+    // and never uploads a resolution upgrade for an already-cached tile while navigating.
+    viewer.fps_display_refresh_hz = Some(144.0);
+    set_test_mode(&mut viewer, Mode::Strip(MangaLayoutMode::Gallery));
+    viewer.masonry_ensure_layout_cache();
+    let ctx = egui::Context::default();
+    let paths = viewer.image_list.clone();
+
+    // Seed index 0 as already cached at 512x512 (1 MiB) while idle.
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(0, paths[0].clone(), 512, 512));
+    viewer.manga_process_pending_loads(&ctx);
+    assert_eq!(viewer.manga_texture_cache.resident_bytes(), 512 * 512 * 4);
+
+    // Activate scroll: make pages 0, 1, 2 visible in Gallery/Long Strip.
+    set_test_mode(&mut viewer, Mode::Strip(MangaLayoutMode::LongStrip));
+    viewer.manga_scroll_offset = 400.0;
+    viewer.manga_scroll_target = 400.0;
+    viewer.manga_wheel_scroll_active = true;
+
+    // Push an upgrade for already-cached index 0, plus two blank large tiles (1000x800 = 3.2 MB > 2 MB) at 1 & 2.
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(0, paths[0].clone(), 1600, 1200));
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(1, paths[1].clone(), 1000, 800));
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(2, paths[2].clone(), 1000, 800));
+    viewer.manga_process_pending_loads(&ctx);
+
+    // Only 1 blank >2 MiB tile (index 1) should upload; index 2 & upgrade 0 remain queued in mailbox!
+    assert_eq!(viewer.manga_uploads_last_pass, 1);
+    assert!(viewer
+        .manga_texture_cache
+        .contains_for_path(1, paths[1].as_path()));
+    assert!(!viewer
+        .manga_texture_cache
+        .contains_for_path(2, paths[2].as_path()));
+    assert_eq!(
+        viewer
+            .manga_texture_cache
+            .peek_texture_dimensions_for_path(0, paths[0].as_path()),
+        Some((512, 512)),
+        "active scroll must defer upgrade for already-cached index 0"
+    );
+
+    // 3) Frame-time backoff skips 1 cooldown frame when SwapBuffers-inclusive previous frame exceeded 1.35x,
+    // then immediately clears because uploads_last_pass becomes 0; never triggers on non-vsync-paced frames.
+    viewer.manga_uploads_last_pass = 1;
+    viewer.manga_last_upload_vsync_paced = false;
+    viewer.fps_last_dt_s = 0.066; // intentional 66ms sleep timer
+    assert!(!viewer.manga_should_backoff_uploads());
+
+    viewer.manga_last_upload_vsync_paced = true;
+    viewer.fps_last_dt_s = 0.012; // 12ms > 6.944 * 1.35 = 9.375ms @ 144Hz
+    assert!(viewer.manga_should_backoff_uploads());
+    viewer.manga_process_pending_loads(&ctx);
+    assert_eq!(viewer.manga_uploads_last_pass, 0);
+    assert!(!viewer.manga_should_backoff_uploads());
+
+    // 4) Settled pass caps total RGBA bytes and allows at most 1 >2 MiB mipmapped upload per frame.
+    viewer.manga_wheel_scroll_active = false;
+    viewer.manga_decoded_mailbox.clear();
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(3, paths[3].clone(), 1000, 800)); // 3.2 MB, mipmapped
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(4, paths[4].clone(), 1000, 800)); // 3.2 MB, mipmapped
+    viewer.manga_process_pending_loads(&ctx);
+    assert_eq!(
+        viewer.manga_uploads_last_pass, 1,
+        "settled pass must cap large (>2 MiB) mipmapped textures to 1 per frame"
+    );
+    assert_eq!(viewer.manga_decoded_mailbox.len(), 1);
+}
+
+#[test]
+pub(crate) fn masonry_static_respects_caps_hysteresis_and_settle_debounce() {
+    let mut viewer = masonry_test_viewer(1920.0, 60);
+    viewer.max_texture_side = 8192;
+    viewer.masonry_items_per_row = 6;
+    viewer.manga_visible_indices_last = 48; // dense grid: nav_cap = 160, fill_cap = 224
+    viewer.manga_target_texture_side = 4096;
+    viewer.manga_loader = Some(MangaLoader::without_workers());
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for index in 0..60 {
+            loader
+                .dimension_cache
+                .insert(index, (6000, 4000, MangaMediaType::StaticImage));
+        }
+    }
+
+    // 1) Active navigation: Masonry StaticImage initial fill must respect navigation cap (quantized from <=160 -> 192), not 2048/4096!
+    viewer.manga_wheel_scroll_active = true;
+    assert!(viewer.manga_navigation_active_for_heavy_work());
+    assert!(viewer.manga_request_retry_for_visible_item(
+        0,
+        2048,
+        false,
+        MangaMediaType::StaticImage,
+        true,
+    ));
+    let nav_req = viewer
+        .manga_loader
+        .as_ref()
+        .unwrap()
+        .probe
+        .as_ref()
+        .unwrap()
+        .urgent
+        .try_recv()
+        .expect("nav fill request");
+    let expected_nav_cap = MangaLoader::quantize_target_texture_side(
+        viewer.masonry_navigation_target_side_cap(),
+        viewer.max_texture_side,
+    );
+    assert!(
+        nav_req.target_texture_side <= expected_nav_cap && nav_req.target_texture_side < 2048,
+        "StaticImage nav fill side {} exceeded quantized cap {} (raw {})",
+        nav_req.target_texture_side,
+        expected_nav_cap,
+        viewer.masonry_navigation_target_side_cap()
+    );
+
+    // 2) Settled initial fill: Masonry StaticImage respects fill_cap (quantized from <=224 -> 256), not 2048/4096.
+    viewer.manga_wheel_scroll_active = false;
+    assert!(viewer.manga_request_retry_for_visible_item(
+        1,
+        2048,
+        false,
+        MangaMediaType::StaticImage,
+        false,
+    ));
+    let fill_req = viewer
+        .manga_loader
+        .as_ref()
+        .unwrap()
+        .probe
+        .as_ref()
+        .unwrap()
+        .urgent
+        .try_recv()
+        .expect("settled fill request");
+    let expected_fill_cap = MangaLoader::quantize_target_texture_side(
+        viewer.masonry_fill_target_side_cap(),
+        viewer.max_texture_side,
+    );
+    assert!(
+        fill_req.target_texture_side <= expected_fill_cap && fill_req.target_texture_side < 2048,
+        "StaticImage fill side {} exceeded quantized cap {} (raw {})",
+        fill_req.target_texture_side,
+        expected_fill_cap,
+        viewer.masonry_fill_target_side_cap()
+    );
+
+    // 3) Masonry StaticImage upgrade hysteresis ignores trivial (<15% and <96px) growth,
+    // accepts meaningful LOD growth, and skips quality upgrades during nav or settle debounce.
+    assert!(!viewer.manga_texture_upgrade_needed(512, 512, 520, 520, MangaMediaType::StaticImage));
+    assert!(viewer.manga_texture_upgrade_needed(512, 512, 768, 768, MangaMediaType::StaticImage));
+    assert!(viewer.manga_texture_upgrade_needed(160, 160, 256, 256, MangaMediaType::StaticImage));
+
+    viewer.last_manga_nav_active_at = Some(Instant::now());
+    assert!(viewer.manga_settle_debounce_remaining().is_some());
+    assert!(!viewer.manga_request_retry_for_visible_item(
+        2,
+        1024,
+        true,
+        MangaMediaType::StaticImage,
+        false,
+    ));
+
+    // Once debounce expires, quality upgrade requests run cleanly.
+    viewer.last_manga_nav_active_at =
+        Some(Instant::now() - Duration::from_millis(ImageViewer::MANGA_SETTLE_DEBOUNCE_MS + 20));
+    assert!(viewer.manga_settle_debounce_remaining().is_none());
+    assert!(viewer.manga_request_retry_for_visible_item(
+        2,
+        1024,
+        true,
+        MangaMediaType::StaticImage,
+        false,
+    ));
+}
+
+#[test]
+pub(crate) fn long_strip_caps_unzoomed_lod_and_settle_debounce_wakes_without_spin() {
+    let mut viewer = long_strip_scroll_test_viewer(6);
+    viewer.screen_size = egui::vec2(3840.0, 2160.0); // 4K
+    viewer.max_texture_side = 8192;
+    viewer.config.use_hardware_acceleration = true;
+    viewer.config.manga_mipmap_static = true;
+    viewer.config.manga_mipmap_min_side = 128;
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        for idx in 0..6 {
+            loader
+                .dimension_cache
+                .insert(idx, (6000, 4000, MangaMediaType::StaticImage));
+        }
+    }
+    viewer.invalidate_manga_layout_cache();
+
+    // Unzoomed active scrolling caps <= 2048; unzoomed settled caps <= 2560 (never 8192!).
+    viewer.zoom = 1.0;
+    viewer.manga_wheel_scroll_active = true;
+    assert!(viewer.manga_target_texture_side_for_preload(0, &[0]) <= 2048);
+    viewer.manga_wheel_scroll_active = false;
+    assert!(viewer.manga_target_texture_side_for_preload(0, &[0]) <= 2560);
+
+    // Zoomed in + active stays <= 4096; zoomed in + settled allows > 4096.
+    viewer.zoom = 2.0;
+    viewer.manga_wheel_scroll_active = true;
+    assert!(viewer.manga_target_texture_side_for_preload(0, &[0]) <= 4096);
+    viewer.manga_wheel_scroll_active = false;
+    assert!(viewer.manga_target_texture_side_for_preload(0, &[0]) > 4096);
+
+    // Settle debounce holds deferred-mipmap upgrades and arms single wake timer until 350ms elapses.
+    viewer.zoom = 1.0;
+    viewer.screen_size = egui::vec2(1000.0, 700.0);
+    viewer.max_texture_side = 2048;
+    let ctx = egui::Context::default();
+    let path0 = viewer.image_list[0].clone();
+    viewer.manga_wheel_scroll_active = true;
+    viewer
+        .manga_decoded_mailbox
+        .push_back(make_test_decoded_page(0, path0.clone(), 1000, 1500));
+    viewer.manga_process_pending_loads(&ctx);
+    assert!(viewer
+        .manga_texture_cache
+        .is_mipmap_deferred_for_path(0, path0.as_path()));
+
+    viewer.manga_wheel_scroll_active = false;
+    viewer.last_manga_nav_active_at = Some(Instant::now());
+    assert_eq!(
+        viewer.manga_tick_deferred_mipmap_upgrades(&[0]),
+        (false, false)
+    );
+    assert!(viewer.manga_deferred_mipmap_wake_at.is_some());
+    assert!(viewer.manga_settle_upgrade_wake().is_some());
+
+    // Simulate debounce elapsed -> queues upgrade cleanly and clears wake timer once idle.
+    viewer.last_manga_nav_active_at =
+        Some(Instant::now() - Duration::from_millis(ImageViewer::MANGA_SETTLE_DEBOUNCE_MS + 20));
+    assert_eq!(
+        viewer.manga_tick_deferred_mipmap_upgrades(&[0]),
+        (true, true)
+    );
+    assert!(viewer.manga_deferred_mipmap_wake_at.is_none());
+}
+
+#[test]
+pub(crate) fn long_strip_background_dimension_warmup_sweeps_non_blockingly() {
+    let mut viewer = long_strip_scroll_test_viewer(40);
+    viewer.manga_loader = Some(MangaLoader::without_workers());
+    viewer.strip_dim_warmup_last_tick_at = Instant::now() - Duration::from_millis(120);
+
+    // Active scrolling skips warmup probing.
+    viewer.manga_wheel_scroll_active = true;
+    viewer.tick_strip_background_dimension_warmup();
+    assert_eq!(viewer.strip_dim_warmup_cursor, 0);
+
+    // Settled Long Strip sweeps first batch of 32 cleanly onto background dim queue.
+    viewer.manga_wheel_scroll_active = false;
+    viewer.tick_strip_background_dimension_warmup();
+    assert_eq!(viewer.strip_dim_warmup_cursor, 32);
+    assert!(!viewer.strip_dim_warmup_complete);
+    let queued = viewer
+        .manga_loader
+        .as_ref()
+        .unwrap()
+        .probe
+        .as_ref()
+        .unwrap()
+        .dim_background_requests
+        .try_recv()
+        .expect("background dim batch");
+    assert_eq!(queued.items.len(), 32);
+}

@@ -72,6 +72,8 @@ mod tests {
             preserve_recent_cache: false,
             previous_cache_capacity: MANGA_CACHE_MIN_ENTRIES,
             cached_indices: cached,
+            cached_resident_bytes: 0,
+            cached_entry_bytes: &[],
         }
     }
 
@@ -1353,5 +1355,99 @@ mod tests {
         loader.demand(&demand(&list, &[0], &[], 0, MangaLayoutMode::Masonry));
         assert!(!loader.retry_blocked(0));
         assert!(loader.probe_blocked.is_empty());
+    }
+
+    #[test]
+    pub(crate) fn long_strip_demand_retains_cache_under_vram_budget_and_defers_nav_eviction() {
+        let list = paths(200);
+        let visible = [40usize, 41];
+        // Indices 0..3 and 120..123 sit far outside Long Strip's keep window around 40.
+        let cached = [0usize, 1, 2, 40, 41, 120, 121];
+        let entry_bytes: Vec<(usize, usize)> =
+            cached.iter().map(|&idx| (idx, 20 * 1024 * 1024)).collect();
+
+        // 1) Under VRAM budget (140 MiB <= 768 MiB idle): keep all cached pages warm!
+        let mut loader = MangaLoader::without_workers();
+        let mut d = demand(&list, &visible, &cached, 40, MangaLayoutMode::LongStrip);
+        d.cached_resident_bytes = 140 * 1024 * 1024;
+        d.cached_entry_bytes = &entry_bytes;
+        let plan = loader.demand(&d);
+        assert!(
+            plan.evicted_indices.is_empty(),
+            "Long Strip under VRAM budget must not thrash pages outside keep_window: {:?}",
+            plan.evicted_indices
+        );
+
+        // 2) Over idle VRAM budget (e.g. 900 MiB across entries): evict furthest first until <= budget.
+        let heavy_bytes: Vec<(usize, usize)> = vec![
+            (0, 100 * 1024 * 1024),
+            (1, 100 * 1024 * 1024),
+            (2, 100 * 1024 * 1024),
+            (40, 100 * 1024 * 1024),
+            (41, 100 * 1024 * 1024),
+            (120, 200 * 1024 * 1024),
+            (121, 200 * 1024 * 1024),
+        ];
+        let mut d_over = demand(&list, &visible, &cached, 40, MangaLayoutMode::LongStrip);
+        d_over.cached_resident_bytes = 900 * 1024 * 1024; // > 768 MiB
+        d_over.cached_entry_bytes = &heavy_bytes;
+        let plan_over = loader.demand(&d_over);
+        // Distance from 40: idx 121 is furthest (81), idx 120 is next (80); freeing 200 MiB drops 900 -> 700 <= 768 MiB.
+        assert_eq!(plan_over.evicted_indices, vec![121]);
+        assert!(!plan_over.evicted_indices.contains(&40));
+        assert!(!plan_over.evicted_indices.contains(&41));
+
+        // 3) Active navigation defers non-critical eviction while <= 1.25x safety ceiling (640 MiB).
+        let mut d_nav_safe = demand(&list, &visible, &cached, 40, MangaLayoutMode::LongStrip);
+        d_nav_safe.navigation_active = true;
+        d_nav_safe.cached_resident_bytes = 600 * 1024 * 1024; // > 512 MiB nav budget, <= 640 MiB ceiling
+        d_nav_safe.cached_entry_bytes = &heavy_bytes;
+        let plan_nav_safe = loader.demand(&d_nav_safe);
+        assert!(plan_nav_safe.evicted_indices.is_empty());
+
+        // Above 1.25x safety ceiling while navigating: trims furthest entries safely.
+        let mut d_nav_unsafe = demand(&list, &visible, &cached, 40, MangaLayoutMode::LongStrip);
+        d_nav_unsafe.navigation_active = true;
+        d_nav_unsafe.cached_resident_bytes = 900 * 1024 * 1024;
+        d_nav_unsafe.cached_entry_bytes = &heavy_bytes;
+        let plan_nav_unsafe = loader.demand(&d_nav_unsafe);
+        assert!(!plan_nav_unsafe.evicted_indices.is_empty());
+    }
+
+    #[test]
+    pub(crate) fn background_large_drop_executes_off_calling_thread() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::thread::ThreadId;
+
+        struct ProbeDrop {
+            caller: ThreadId,
+            ran: Arc<AtomicBool>,
+            different_thread: Arc<AtomicBool>,
+        }
+        impl Drop for ProbeDrop {
+            fn drop(&mut self) {
+                self.different_thread.store(
+                    std::thread::current().id() != self.caller,
+                    Ordering::Release,
+                );
+                self.ran.store(true, Ordering::Release);
+            }
+        }
+
+        let ran = Arc::new(AtomicBool::new(false));
+        let different_thread = Arc::new(AtomicBool::new(false));
+        defer_large_drop(ProbeDrop {
+            caller: std::thread::current().id(),
+            ran: Arc::clone(&ran),
+            different_thread: Arc::clone(&different_thread),
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ran.load(Ordering::Acquire) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(ran.load(Ordering::Acquire));
+        assert!(different_thread.load(Ordering::Acquire));
     }
 }
