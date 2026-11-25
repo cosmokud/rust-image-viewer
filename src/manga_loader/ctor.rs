@@ -247,10 +247,12 @@ impl Drop for MangaLoader {
 
 impl MangaTextureCache {
     pub fn new(max_entries: usize) -> Self {
-        let capacity = NonZeroUsize::new(max_entries.max(1)).expect("cache capacity is non-zero");
         Self {
             pinned_entries: HashMap::with_capacity(max_entries),
-            unpinned_entries: LruCache::new(capacity),
+            // Unbounded internally so `LruCache::put` / `resize` never silently drop
+            // entries without subtracting `resident_bytes` and reporting evicted indices;
+            // `max_entries` and `vram_budget_bytes` are enforced in `evict_to_capacity_with_policy`.
+            unpinned_entries: LruCache::unbounded(),
             max_entries: max_entries.max(1),
             pinned_indices: HashSet::new(),
             last_pinned_sorted: Vec::new(),

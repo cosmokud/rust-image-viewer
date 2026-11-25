@@ -114,9 +114,11 @@ impl MangaTextureCache {
     ) -> Vec<usize> {
         self.max_entries = max_entries.max(1);
         self.vram_budget_bytes = vram_budget_bytes.max(1);
-        let capacity = NonZeroUsize::new(self.max_entries).expect("cache capacity is non-zero");
-        self.unpinned_entries.resize(capacity);
-        let safety_ceiling = safety_ceiling_bytes_for_budget(self.vram_budget_bytes);
+        let safety_ceiling = if defer_non_critical_eviction {
+            safety_ceiling_bytes_for_budget(self.vram_budget_bytes)
+        } else {
+            self.vram_budget_bytes
+        };
         self.evict_to_capacity_with_policy(!defer_non_critical_eviction, safety_ceiling)
     }
 
@@ -133,7 +135,11 @@ impl MangaTextureCache {
             .collect();
         for idx in to_unpin {
             if let Some(entry) = self.pinned_entries.remove(&idx) {
-                self.unpinned_entries.put(idx, entry);
+                if let Some(prev) = self.unpinned_entries.put(idx, entry) {
+                    self.resident_bytes = self
+                        .resident_bytes
+                        .saturating_sub(Self::entry_rgba_bytes(prev.width, prev.height));
+                }
             }
         }
 

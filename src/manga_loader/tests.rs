@@ -1450,4 +1450,108 @@ mod tests {
         assert!(ran.load(Ordering::Acquire));
         assert!(different_thread.load(Ordering::Acquire));
     }
+
+    #[test]
+    pub(crate) fn manga_texture_cache_never_leaks_resident_bytes_or_evictions_on_unpin_shrink_or_insert(
+    ) {
+        let ctx = egui::Context::default();
+        let make_handle = |name: &str, w: u32, h: u32| {
+            ctx.load_texture(
+                name,
+                egui::ColorImage::new([w as usize, h as usize], egui::Color32::BLACK),
+                egui::TextureOptions::LINEAR,
+            )
+        };
+        let sum_cached_bytes = |cache: &MangaTextureCache| -> usize {
+            let mut entries = Vec::new();
+            cache.cached_entries_bytes_into(&mut entries);
+            entries.into_iter().map(|(_, bytes)| bytes).sum()
+        };
+
+        let mut cache = MangaTextureCache::new(6);
+        let large_vram = 128 * 1024 * 1024;
+        cache.set_limits_and_maybe_evict(6, large_vram, false);
+
+        // Insert 5 entries (indices 0..5), each 100x50 = 20_000 bytes.
+        for i in 0..5 {
+            let p = PathBuf::from(format!("page_{i}.png"));
+            let h = make_handle(&format!("t_{i}"), 100, 50);
+            let evicted = cache.insert_with_type(i, p, h, 100, 50, MangaMediaType::StaticImage);
+            assert!(evicted.is_empty());
+        }
+        assert_eq!(cache.resident_bytes(), 5 * 20_000);
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+
+        // (a1) Shrink max_entries while deferred: nothing is silently dropped by LruCache::resize.
+        let deferred_evicted = cache.set_limits_and_maybe_evict(3, large_vram, true);
+        assert!(deferred_evicted.is_empty());
+        assert_eq!(cache.resident_bytes(), 5 * 20_000);
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+
+        // (a2) Settle shrink max_entries to 3: returns exact 2 LRU evicted indices & subtracts bytes.
+        let settled_evicted = cache.set_limits_and_maybe_evict(3, large_vram, false);
+        assert_eq!(settled_evicted, vec![0, 1]);
+        assert_eq!(cache.resident_bytes(), 3 * 20_000);
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+
+        // (b) Pin 4 entries (> max_entries=3) then unpin all past max_entries: no silent drop in set_pinned_indices!
+        cache.set_pinned_indices([2, 3, 4, 10, 11]);
+        for &idx in &[10usize, 11] {
+            let p = PathBuf::from(format!("page_{idx}.png"));
+            let h = make_handle(&format!("t_{idx}"), 50, 50); // 10_000 bytes each
+            let evicted = cache.insert_with_type_and_eviction_policy(
+                idx,
+                p,
+                h,
+                50,
+                50,
+                MangaMediaType::StaticImage,
+                false,
+                true,
+            );
+            assert!(evicted.is_empty());
+        }
+        assert_eq!(cache.resident_bytes(), 3 * 20_000 + 2 * 10_000);
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+
+        // Unpin all while max_entries=3 (5 cached total): resident_bytes must stay exact until explicit evict.
+        cache.set_pinned_indices(std::iter::empty());
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+        assert_eq!(cache.resident_bytes(), 3 * 20_000 + 2 * 10_000);
+
+        let after_unpin_evicted = cache.set_limits_and_maybe_evict(3, large_vram, false);
+        assert_eq!(after_unpin_evicted.len(), 2);
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+
+        // (c) Insert new entries at max_entries=3: evicts oldest, updates resident_bytes, reports evicted indices.
+        for (idx, w, h) in [(20usize, 80u32, 80u32), (21usize, 90u32, 90u32)] {
+            let p = PathBuf::from(format!("page_{idx}.png"));
+            let handle = make_handle(&format!("t_{idx}"), w, h);
+            let evicted = cache.insert_with_type_and_eviction_policy(
+                idx,
+                p,
+                handle,
+                w,
+                h,
+                MangaMediaType::StaticImage,
+                false,
+                false,
+            );
+            assert_eq!(evicted.len(), 1);
+            assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+        }
+
+        // Replacing an existing entry updates resident_bytes without leaking old dimensions.
+        let replace_handle = make_handle("t_21_upgrade", 120, 120);
+        let evicted = cache.insert_with_type(
+            21,
+            PathBuf::from("page_21.png"),
+            replace_handle,
+            120,
+            120,
+            MangaMediaType::StaticImage,
+        );
+        assert!(evicted.is_empty());
+        assert_eq!(cache.resident_bytes(), sum_cached_bytes(&cache));
+    }
 }
