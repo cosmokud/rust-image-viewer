@@ -2268,4 +2268,162 @@ pub(crate) fn scroll_anchor_preserves_top_and_bottom_overscroll_targets() {
     assert!((viewer.manga_scroll_offset - (max_scroll + 40.0)).abs() < 1e-2);
     assert!((viewer.manga_scroll_target - max_scroll).abs() < 1e-2);
     assert_eq!(viewer.manga_scroll_velocity, 200.0);
+
+    // 3) Bottom overscroll when earlier item shrinks max_scroll: offset > new max_scroll is preserved cleanly.
+    if let Some(loader) = viewer.manga_loader.as_mut() {
+        loader
+            .dimension_cache
+            .insert(0, (1080, 600, MangaMediaType::StaticImage));
+    }
+    viewer.invalidate_manga_layout_cache();
+    let shrunk_max = (viewer.manga_total_height() - viewer.screen_size.y).max(0.0);
+    assert!(shrunk_max < max_scroll);
+    viewer.manga_scroll_offset = shrunk_max + 40.0;
+    viewer.manga_scroll_target = shrunk_max;
+    viewer.manga_apply_scroll_anchor((9, 0.5));
+    assert!((viewer.manga_scroll_offset - (shrunk_max + 40.0)).abs() < 1e-2);
+    assert!((viewer.manga_scroll_target - shrunk_max).abs() < 1e-2);
+}
+
+#[test]
+pub(crate) fn wheel_escapes_top_and_bottom_overscroll_smoothly_without_deadlock() {
+    let dt = 1.0 / 144.0;
+
+    // 1) Top overscroll (offset = -45, v = -500) followed by wheel DOWN must escape smoothly to target.
+    let mut viewer = long_strip_scroll_test_viewer(20);
+    viewer.manga_wheel_scroll_active = true;
+    viewer.manga_scroll_offset = -45.0;
+    viewer.manga_scroll_target = 0.0;
+    viewer.manga_scroll_velocity = -500.0;
+
+    assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
+    let expected_target = viewer.manga_scroll_target;
+    assert!(expected_target > 100.0);
+    assert!(viewer.manga_scroll_velocity >= 0.0);
+
+    let mut settled = false;
+    for _ in 0..300 {
+        if !viewer.manga_tick_scroll_animation(dt) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "top overscroll wheel escape deadlocked");
+    assert!((viewer.manga_scroll_offset - expected_target).abs() < 1e-2);
+    assert!(!viewer.manga_wheel_scroll_active);
+
+    // 2) Bottom overscroll at large max_scroll (~25000+ px) followed by wheel UP must escape smoothly.
+    let mut tall = long_strip_scroll_test_viewer(30);
+    let max_scroll = (tall.manga_total_height() - tall.screen_size.y).max(0.0);
+    assert!(max_scroll >= 25_000.0);
+
+    tall.manga_wheel_scroll_active = true;
+    tall.manga_scroll_offset = max_scroll + 45.0;
+    tall.manga_scroll_target = max_scroll;
+    tall.manga_scroll_velocity = 500.0;
+
+    assert!(tall.manga_apply_wheel_scroll_input(3.0));
+    let expected_up_target = tall.manga_scroll_target;
+    assert!(expected_up_target < max_scroll - 100.0);
+    assert!(tall.manga_scroll_velocity <= 0.0);
+
+    settled = false;
+    for _ in 0..300 {
+        if !tall.manga_tick_scroll_animation(dt) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(
+        settled,
+        "bottom overscroll wheel escape deadlocked at max_scroll={max_scroll}"
+    );
+    assert!((tall.manga_scroll_offset - expected_up_target).abs() < 1e-2);
+    assert!(!tall.manga_wheel_scroll_active);
+}
+
+#[test]
+pub(crate) fn wheel_ignores_stale_opposing_keyboard_velocity_at_top_and_bottom() {
+    let dt = 1.0 / 144.0;
+
+    // 1) Spamming Up/PgUp leaves huge negative velocity (-5000) while sitting at top 0.0.
+    // Switching to wheel DOWN must zero stale negative velocity and scroll down cleanly.
+    let mut top = long_strip_scroll_test_viewer(20);
+    top.manga_wheel_scroll_active = false;
+    top.manga_scroll_offset = 0.0;
+    top.manga_scroll_target = 0.0;
+    top.manga_scroll_velocity = -5000.0;
+
+    assert!(top.manga_apply_wheel_scroll_input(-3.0));
+    assert_eq!(top.manga_scroll_velocity, 0.0);
+    let target_down = top.manga_scroll_target;
+    let mut settled = false;
+    for _ in 0..300 {
+        let active = top.manga_tick_scroll_animation(dt);
+        assert!(
+            top.manga_scroll_offset >= 0.0,
+            "must never slip negative: {}",
+            top.manga_scroll_offset
+        );
+        if !active {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert!((top.manga_scroll_offset - target_down).abs() < 1e-2);
+
+    // 2) Spamming Down/PgDn leaves huge positive velocity (+5000) while sitting at bottom max_scroll.
+    // Switching to wheel UP must zero stale positive velocity and scroll up cleanly.
+    let mut bottom = long_strip_scroll_test_viewer(20);
+    let max_scroll = (bottom.manga_total_height() - bottom.screen_size.y).max(0.0);
+    bottom.manga_wheel_scroll_active = false;
+    bottom.manga_scroll_offset = max_scroll;
+    bottom.manga_scroll_target = max_scroll;
+    bottom.manga_scroll_velocity = 5000.0;
+
+    assert!(bottom.manga_apply_wheel_scroll_input(3.0));
+    assert_eq!(bottom.manga_scroll_velocity, 0.0);
+    let target_up = bottom.manga_scroll_target;
+    settled = false;
+    for _ in 0..300 {
+        let active = bottom.manga_tick_scroll_animation(dt);
+        assert!(
+            bottom.manga_scroll_offset <= max_scroll + 1e-3,
+            "must never slip past bottom: {} > {}",
+            bottom.manga_scroll_offset,
+            max_scroll
+        );
+        if !active {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert!((bottom.manga_scroll_offset - target_up).abs() < 1e-2);
+}
+
+#[test]
+pub(crate) fn wheel_bottom_edge_settles_cleanly_at_large_max_scroll() {
+    let mut viewer = long_strip_scroll_test_viewer(60);
+    let max_scroll = (viewer.manga_total_height() - viewer.screen_size.y).max(0.0);
+    assert!(max_scroll >= 50_000.0);
+
+    viewer.manga_scroll_offset = max_scroll;
+    viewer.manga_scroll_target = max_scroll;
+    assert!(viewer.manga_apply_wheel_scroll_input(-3.0)); // Bounce past large bottom boundary
+
+    let dt = 1.0 / 144.0;
+    let mut settled = false;
+    for _ in 0..400 {
+        if !viewer.manga_tick_scroll_animation(dt) {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "bottom bounce stalled near large max_scroll");
+    assert_eq!(viewer.manga_scroll_offset, max_scroll);
+    assert_eq!(viewer.manga_scroll_target, max_scroll);
+    assert_eq!(viewer.manga_scroll_velocity, 0.0);
+    assert!(!viewer.manga_wheel_scroll_active);
 }
