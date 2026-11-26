@@ -2052,3 +2052,193 @@ pub(crate) fn long_strip_background_dimension_warmup_sweeps_non_blockingly() {
         .expect("background dim batch");
     assert_eq!(queued.items.len(), 32);
 }
+
+#[test]
+pub(crate) fn wheel_scroll_spring_c1_zero_frame1_slam_and_exact_settle() {
+    for layout in [MangaLayoutMode::LongStrip, MangaLayoutMode::Masonry] {
+        let mut viewer = if layout.is_grid() {
+            let mut v = masonry_test_viewer(1920.0, 40);
+            v.masonry_items_per_row = 4;
+            v.zoom = 1.0;
+            let _ = v.manga_total_height();
+            v
+        } else {
+            long_strip_scroll_test_viewer(20)
+        };
+
+        let expected_travel =
+            3.0 * viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate;
+        assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
+        assert!(viewer.manga_wheel_scroll_active);
+        // Zero frame-1 velocity slam at input arrival (C^1 start from rest).
+        assert_eq!(viewer.manga_scroll_velocity, 0.0);
+        assert!((viewer.manga_scroll_target - expected_travel).abs() < 1e-2);
+
+        let dt = 1.0 / 144.0;
+        assert!(viewer.manga_tick_scroll_animation(dt));
+        // Frame 1 displacement @ 144Hz is gentle (~6.7 px), eliminating the old ~50 px snap.
+        assert!(
+            viewer.manga_scroll_offset > 1.0 && viewer.manga_scroll_offset < 12.0,
+            "{layout:?} frame-1 jump = {}",
+            viewer.manga_scroll_offset
+        );
+
+        let mut max_offset = viewer.manga_scroll_offset;
+        let mut settled = false;
+        for _ in 0..300 {
+            let active = viewer.manga_tick_scroll_animation(dt);
+            assert!(
+                viewer.manga_scroll_offset <= expected_travel + 1e-2,
+                "{layout:?} must not overshoot target: {} > {}",
+                viewer.manga_scroll_offset,
+                expected_travel
+            );
+            assert!(viewer.manga_scroll_offset + 1e-4 >= max_offset);
+            max_offset = viewer.manga_scroll_offset;
+            if !active {
+                settled = true;
+                break;
+            }
+        }
+        assert!(settled, "{layout:?} wheel spring failed to settle");
+        assert!((viewer.manga_scroll_offset - expected_travel).abs() < 1e-2);
+        assert_eq!(viewer.manga_scroll_velocity, 0.0);
+        assert!(!viewer.manga_wheel_scroll_active);
+    }
+}
+
+#[test]
+pub(crate) fn wheel_multi_notch_at_144hz_has_no_sawtooth_velocity() {
+    let mut viewer = long_strip_scroll_test_viewer(30);
+    let expected_notch =
+        3.0 * viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate;
+    let dt = 1.0 / 144.0;
+
+    let mut notch_count = 0;
+    for frame in 0..240 {
+        if frame % 12 == 0 && notch_count < 4 {
+            // ~83ms between notches at 144Hz
+            let vel_before = viewer.manga_scroll_velocity;
+            assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
+            assert!(
+                (viewer.manga_scroll_velocity - vel_before).abs() < 1e-4,
+                "velocity jumped discontinuously on notch {notch_count}: {vel_before} -> {}",
+                viewer.manga_scroll_velocity
+            );
+            notch_count += 1;
+        }
+        let _ = viewer.manga_tick_scroll_animation(dt);
+    }
+
+    while viewer.manga_tick_scroll_animation(dt) {}
+    assert!((viewer.manga_scroll_offset - 4.0 * expected_notch).abs() < 0.25);
+    assert!(!viewer.manga_wheel_scroll_active);
+}
+
+#[test]
+pub(crate) fn wheel_scroll_frame_rate_invariant_across_checkpoints_60_144_200hz() {
+    let simulate_to_time = |hz: usize, duration_s: f32| -> f32 {
+        let mut viewer = long_strip_scroll_test_viewer(30);
+        assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
+        let frame_dt = 1.0 / hz as f32;
+        let mut elapsed = 0.0;
+        while elapsed + 1e-6 < duration_s {
+            let step = (duration_s - elapsed).min(frame_dt);
+            let _ = viewer.manga_tick_scroll_animation(step);
+            elapsed += step;
+        }
+        viewer.manga_scroll_offset
+    };
+
+    for t in [0.05_f32, 0.10, 0.20, 0.40] {
+        let o60 = simulate_to_time(60, t);
+        let o144 = simulate_to_time(144, t);
+        let o200 = simulate_to_time(200, t);
+        assert!(
+            (o144 - o60).abs() < 0.25,
+            "t={t}s mismatch: 144Hz={o144} vs 60Hz={o60}"
+        );
+        assert!(
+            (o200 - o60).abs() < 0.25,
+            "t={t}s mismatch: 200Hz={o200} vs 60Hz={o60}"
+        );
+    }
+}
+
+#[test]
+pub(crate) fn wheel_scroll_instant_direction_reversal_and_edge_overscroll_bounce() {
+    // 1) Direction reversal discards stale lead immediately without velocity jump.
+    let mut viewer = long_strip_scroll_test_viewer(30);
+    assert!(viewer.manga_apply_wheel_scroll_input(-9.0)); // 3 notches down
+    let dt = 1.0 / 144.0;
+    for _ in 0..8 {
+        assert!(viewer.manga_tick_scroll_animation(dt));
+    }
+    let offset_at_reversal = viewer.manga_scroll_offset;
+    let vel_at_reversal = viewer.manga_scroll_velocity;
+    assert!(offset_at_reversal > 10.0);
+    assert!(vel_at_reversal > 100.0);
+    assert!(viewer.manga_scroll_target > offset_at_reversal + 500.0);
+
+    let notch_px =
+        3.0 * viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate;
+    assert!(viewer.manga_apply_wheel_scroll_input(3.0)); // Reverse up 1 notch
+    assert!(
+        (viewer.manga_scroll_velocity - vel_at_reversal).abs() < 1e-4,
+        "reversal must preserve C^1 velocity"
+    );
+    assert!(
+        (viewer.manga_scroll_target - (offset_at_reversal - notch_px).max(0.0)).abs() < 1.0,
+        "target must redirect immediately behind offset on reversal: target={} offset={}",
+        viewer.manga_scroll_target,
+        offset_at_reversal
+    );
+
+    // 2) Edge overscroll at top (0.0) and bottom (max_scroll) bounces softly and settles.
+    let mut edge = long_strip_scroll_test_viewer(10);
+    let max_overscroll = edge.manga_wheel_max_overscroll();
+    assert!(edge.manga_apply_wheel_scroll_input(3.0)); // Wheel up while at top 0.0
+    assert!(edge.manga_wheel_scroll_active);
+    let mut min_seen = 0.0_f32;
+    let mut settled = false;
+    for _ in 0..300 {
+        let active = edge.manga_tick_scroll_animation(dt);
+        min_seen = min_seen.min(edge.manga_scroll_offset);
+        assert!(edge.manga_scroll_offset >= -max_overscroll - 1e-2);
+        assert!(edge.manga_scroll_offset <= 0.0 + 1e-4);
+        if !active {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert!(min_seen < -5.0, "top edge should soft-bounce: {min_seen}");
+    assert_eq!(edge.manga_scroll_offset, 0.0);
+    assert_eq!(edge.manga_scroll_velocity, 0.0);
+    assert!(!edge.manga_wheel_scroll_active);
+
+    let max_scroll = (edge.manga_total_height() - edge.screen_size.y).max(0.0);
+    edge.manga_scroll_offset = max_scroll;
+    edge.manga_scroll_target = max_scroll;
+    assert!(edge.manga_apply_wheel_scroll_input(-3.0)); // Wheel down while at bottom
+    let mut max_seen = max_scroll;
+    settled = false;
+    for _ in 0..300 {
+        let active = edge.manga_tick_scroll_animation(dt);
+        max_seen = max_seen.max(edge.manga_scroll_offset);
+        assert!(edge.manga_scroll_offset <= max_scroll + max_overscroll + 1e-2);
+        assert!(edge.manga_scroll_offset >= max_scroll - 1e-4);
+        if !active {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert!(
+        max_seen > max_scroll + 5.0,
+        "bottom edge should soft-bounce: {max_seen} vs {max_scroll}"
+    );
+    assert_eq!(edge.manga_scroll_offset, max_scroll);
+    assert_eq!(edge.manga_scroll_velocity, 0.0);
+    assert!(!edge.manga_wheel_scroll_active);
+}
