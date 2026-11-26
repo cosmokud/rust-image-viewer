@@ -167,6 +167,14 @@ impl ImageViewer {
         let new_offset = start_y + within;
 
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
+        if self.manga_wheel_scroll_active && self.manga_scroll_offset < 0.0 {
+            let max_overscroll = self.manga_wheel_max_overscroll();
+            self.manga_scroll_offset = self.manga_scroll_offset.clamp(-max_overscroll, 0.0);
+            self.manga_scroll_target = (delta_to_target).clamp(0.0, max_scroll);
+            self.manga_scroll_velocity = preserved_velocity;
+            return;
+        }
+
         let new_offset = new_offset.clamp(0.0, max_scroll);
 
         self.manga_scroll_offset = new_offset;

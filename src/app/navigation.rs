@@ -49,6 +49,7 @@ impl ImageViewer {
         }
 
         if self.mode().is_strip() {
+            self.stop_manga_wheel_scroll();
             self.set_current_index_clamped(target_index);
             let scroll_to = self.manga_get_scroll_offset_for_index(target_index);
             self.manga_scroll_target = scroll_to;
@@ -70,6 +71,7 @@ impl ImageViewer {
 
         // In manga mode, scroll to previous image instead of loading
         if self.mode().is_strip() {
+            self.stop_manga_wheel_scroll();
             let prev_index = if self.current_index == 0 {
                 self.image_list.len() - 1
             } else {

@@ -838,7 +838,7 @@ impl ImageViewer {
         let scroll_motion_active = self.manga_shift_wheel_pan_velocity_x.abs() > 0.01
             || self.manga_autoscroll_active
             || self.manga_wheel_scroll_active
-            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.5;
+            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.15;
         let dt = if scroll_motion_active {
             self.manga_frame_scroll_dt()
         } else {
@@ -933,7 +933,7 @@ impl ImageViewer {
 
         // Reset monotonic tick once scroll physics settles so the next gesture starts cleanly.
         if !self.manga_wheel_scroll_active
-            && (self.manga_scroll_target - self.manga_scroll_offset).abs() <= 0.5
+            && (self.manga_scroll_target - self.manga_scroll_offset).abs() <= 0.15
             && self.manga_scroll_velocity.abs() <= 0.01
             && self.manga_shift_wheel_pan_velocity_x.abs() <= 0.01
             && !self.manga_autoscroll_active
@@ -1003,7 +1003,12 @@ impl ImageViewer {
                 // Masonry has non-linear row ordering; index/fraction anchors can oscillate when
                 // late dimension updates reshuffle column heights. Preserve absolute scroll instead.
                 let max_scroll = (self.manga_total_height() - self.screen_size.y).max(0.0);
-                let new_offset = masonry_prev_scroll.clamp(0.0, max_scroll);
+                let new_offset = if self.manga_wheel_scroll_active {
+                    let max_overscroll = self.manga_wheel_max_overscroll();
+                    masonry_prev_scroll.clamp(-max_overscroll, max_scroll + max_overscroll)
+                } else {
+                    masonry_prev_scroll.clamp(0.0, max_scroll)
+                };
                 self.manga_scroll_offset = new_offset;
                 self.manga_scroll_target =
                     (new_offset + masonry_prev_target_delta).clamp(0.0, max_scroll);

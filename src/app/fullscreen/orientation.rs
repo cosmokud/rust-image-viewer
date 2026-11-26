@@ -93,6 +93,7 @@ impl ImageViewer {
 
         // In manga mode, scroll to next image instead of loading
         if self.mode().is_strip() {
+            self.stop_manga_wheel_scroll();
             let next_index = if self.current_index + 1 >= self.image_list.len() {
                 0
             } else {

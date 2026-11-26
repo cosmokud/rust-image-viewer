@@ -6,6 +6,11 @@ use crate::app::*;
 use crate::prelude::*;
 
 impl ImageViewer {
+    #[inline]
+    pub(crate) fn manga_wheel_max_overscroll(&self) -> f32 {
+        (self.screen_size.y * 0.12).clamp(36.0, 180.0)
+    }
+
     pub(crate) fn manga_apply_wheel_scroll_input(&mut self, wheel_steps: f32) -> bool {
         if self.mode().is_solo() || !wheel_steps.is_finite() || wheel_steps == 0.0 {
             return false;
@@ -21,16 +26,55 @@ impl ImageViewer {
             .config
             .manga_wheel_impulse_per_step
             .clamp(50.0, 20000.0);
+        let decay_rate = self.config.manga_wheel_decay_rate.clamp(0.5, 40.0);
         let max_velocity = self
             .config
             .manga_wheel_max_velocity
             .clamp(impulse_per_step, 30000.0);
 
-        self.manga_wheel_scroll_active = true;
-        self.manga_scroll_target = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        self.manga_scroll_velocity = (self.manga_scroll_velocity - wheel_steps * impulse_per_step)
-            .clamp(-max_velocity, max_velocity);
+        // Preserve exact per-notch travel distance (`steps * impulse / decay`) while feeding
+        // `manga_scroll_target` instead of slamming velocity discontinuously on frame 1.
+        let delta_px = -wheel_steps * (impulse_per_step / decay_rate);
+        let current_clamped = self.manga_scroll_offset.clamp(0.0, max_scroll);
 
+        if !self.manga_wheel_scroll_active {
+            self.manga_scroll_target = current_clamped;
+        }
+
+        let at_top_edge = self.manga_scroll_offset <= 0.5 && delta_px < 0.0;
+        let at_bottom_edge =
+            self.manga_scroll_offset >= (max_scroll - 0.5).max(0.0) && delta_px > 0.0;
+
+        if at_top_edge || at_bottom_edge {
+            let boundary = if at_top_edge { 0.0 } else { max_scroll };
+            self.manga_scroll_target = boundary;
+
+            let max_overscroll = self.manga_wheel_max_overscroll();
+            let current_overscroll = (self.manga_scroll_offset - current_clamped).abs();
+            let headroom = ((max_overscroll - current_overscroll) / max_overscroll).clamp(0.0, 1.0);
+            let spring_hz = self.config.manga_wheel_edge_spring_hz.clamp(0.5, 20.0);
+            let omega_edge = 2.0 * std::f32::consts::PI * spring_hz;
+            let max_edge_vel =
+                (max_overscroll * std::f32::consts::E * omega_edge * 0.55).min(max_velocity);
+            let nudge = delta_px.signum() * (delta_px.abs() * 2.2 * headroom);
+            self.manga_scroll_velocity =
+                (self.manga_scroll_velocity + nudge).clamp(-max_edge_vel, max_edge_vel);
+        } else {
+            let current_lead = self.manga_scroll_target - current_clamped;
+            if current_lead * delta_px < 0.0 {
+                // Instant direction reversal: clear old unconsumed target lead immediately
+                // while `manga_scroll_velocity` curves smoothly through zero (C^1).
+                self.manga_scroll_target = current_clamped;
+            }
+
+            let max_lead = (max_velocity * 0.65).max(delta_px.abs());
+            let unclamped_target = self.manga_scroll_target + delta_px;
+            let bounded_lead_target =
+                unclamped_target.clamp(current_clamped - max_lead, current_clamped + max_lead);
+            self.manga_scroll_target = bounded_lead_target.clamp(0.0, max_scroll);
+        }
+
+        self.manga_wheel_scroll_active = true;
         true
     }
 
@@ -81,57 +125,106 @@ impl ImageViewer {
     }
 
     pub(crate) fn manga_tick_wheel_scroll_animation(&mut self, dt: f32, max_scroll: f32) -> bool {
-        const SNAP_POSITION_EPSILON: f32 = 0.5;
-        const SNAP_VELOCITY_EPSILON: f32 = 6.0;
+        const SNAP_POSITION_EPSILON: f32 = 0.15;
+        const SNAP_VELOCITY_EPSILON: f32 = 3.0;
 
         let dt = dt.clamp(0.0, 1.0 / 30.0);
+        let impulse_per_step = self
+            .config
+            .manga_wheel_impulse_per_step
+            .clamp(50.0, 20000.0);
         let decay_rate = self.config.manga_wheel_decay_rate.clamp(0.5, 40.0);
+        let max_v = self
+            .config
+            .manga_wheel_max_velocity
+            .clamp(impulse_per_step, 30000.0);
+        let omega = (decay_rate * 2.0).clamp(8.0, 45.0);
         let spring_hz = self.config.manga_wheel_edge_spring_hz.clamp(0.5, 20.0);
-        let omega = 2.0 * std::f32::consts::PI * spring_hz;
-        let max_overscroll = (self.screen_size.y * 0.12).clamp(36.0, 180.0);
+        let omega_edge = 2.0 * std::f32::consts::PI * spring_hz;
+        let max_overscroll = self.manga_wheel_max_overscroll();
 
-        let boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        let overscroll = self.manga_scroll_offset - boundary;
+        let mut offset = self.manga_scroll_offset;
+        let mut velocity = self.manga_scroll_velocity;
+        let target = self.manga_scroll_target.clamp(0.0, max_scroll);
+        self.manga_scroll_target = target;
 
         if dt > 0.0 {
-            if overscroll.abs() > f32::EPSILON {
-                // Exact analytical critically-damped spring (`zeta = 1.0`) for frame-rate independence.
-                let exp = (-omega * dt).exp();
-                let c = self.manga_scroll_velocity + omega * overscroll;
-                let new_overscroll = (overscroll + c * dt) * exp;
-                let new_velocity = (self.manga_scroll_velocity - omega * c * dt) * exp;
-                self.manga_scroll_offset = boundary + new_overscroll;
-                self.manga_scroll_velocity = new_velocity;
+            let at_or_past_top = offset < 0.0 || (offset <= 0.0 && target <= 0.0 && velocity < 0.0);
+            let at_or_past_bottom = offset > max_scroll
+                || (offset >= max_scroll && target >= max_scroll && velocity > 0.0);
+
+            let (unclamped, next_velocity) = if at_or_past_top || at_or_past_bottom {
+                // Exact analytical critically-damped edge spring (`zeta = 1.0`).
+                let boundary = if at_or_past_top { 0.0 } else { max_scroll };
+                let overscroll = offset - boundary;
+                let exp = (-omega_edge * dt).exp();
+                let c = velocity + omega_edge * overscroll;
+                let mut next_overscroll = (overscroll + c * dt) * exp;
+                let mut next_velocity = (velocity - omega_edge * c * dt) * exp;
+
+                if (at_or_past_top && target <= 0.0 && next_overscroll > 0.0)
+                    || (at_or_past_bottom && target >= max_scroll && next_overscroll < 0.0)
+                {
+                    next_overscroll = 0.0;
+                    next_velocity = 0.0;
+                }
+
+                (boundary + next_overscroll, next_velocity)
             } else {
-                let decay = (-decay_rate * dt).exp();
-                let displacement = self.manga_scroll_velocity * (1.0 - decay) / decay_rate;
-                self.manga_scroll_offset += displacement;
-                self.manga_scroll_velocity *= decay;
-            }
+                // Exact analytical critically-damped target spring (`zeta = 1.0`, C^1 velocity,
+                // zero frame-1 slam, zero sawtooth between wheel notches, framerate-independent).
+                let x = offset - target;
+                let exp = (-omega * dt).exp();
+                let c2 = velocity + omega * x;
+                let mut next_x = (x + c2 * dt) * exp;
+                let mut next_velocity = (velocity - omega * c2 * dt) * exp;
+
+                let max_step = max_v * dt;
+                if next_velocity.abs() > max_v || (next_x - x).abs() > max_step {
+                    let mut clamped_delta = (next_x - x).clamp(-max_step, max_step);
+                    if target > 0.0 && target < max_scroll && x * velocity < 0.0 {
+                        // Prevent post-max-velocity discrete lag from overshooting interior targets.
+                        let next_candidate = x + clamped_delta;
+                        if (x < 0.0 && next_candidate > 0.0) || (x > 0.0 && next_candidate < 0.0) {
+                            clamped_delta = -x;
+                            next_velocity = 0.0;
+                        }
+                    }
+                    next_x = x + clamped_delta;
+                    next_velocity = next_velocity.clamp(-max_v, max_v);
+                }
+
+                (target + next_x, next_velocity)
+            };
+
+            let clamped = unclamped.clamp(-max_overscroll, max_scroll + max_overscroll);
+            offset = clamped;
+            velocity = if (clamped < unclamped && next_velocity > 0.0)
+                || (clamped > unclamped && next_velocity < 0.0)
+            {
+                0.0
+            } else {
+                next_velocity
+            };
         }
 
-        let unclamped = self.manga_scroll_offset;
-        let clamped = unclamped.clamp(-max_overscroll, max_scroll + max_overscroll);
-        self.manga_scroll_offset = clamped;
-        if clamped < unclamped && self.manga_scroll_velocity > 0.0 {
-            self.manga_scroll_velocity = 0.0;
-        } else if clamped > unclamped && self.manga_scroll_velocity < 0.0 {
-            self.manga_scroll_velocity = 0.0;
-        }
-        self.manga_scroll_target = self.manga_scroll_offset.clamp(0.0, max_scroll);
+        self.manga_scroll_offset = offset;
+        self.manga_scroll_velocity = velocity;
 
         self.manga_update_current_index();
         self.manga_tick_scroll_cooldown();
 
-        let boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
-        let overscroll = self.manga_scroll_offset - boundary;
-        if overscroll.abs() <= SNAP_POSITION_EPSILON
+        let final_boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
+        let final_overscroll = self.manga_scroll_offset - final_boundary;
+        if (self.manga_scroll_offset - target).abs() <= SNAP_POSITION_EPSILON
+            && final_overscroll.abs() <= SNAP_POSITION_EPSILON
             && self.manga_scroll_velocity.abs() <= SNAP_VELOCITY_EPSILON
         {
-            self.manga_scroll_offset = boundary;
-            self.manga_scroll_target = boundary;
+            self.manga_scroll_offset = target;
+            self.manga_scroll_target = target;
             self.manga_scroll_velocity = 0.0;
             self.manga_wheel_scroll_active = false;
+            self.last_manga_scroll_tick = None;
             return false;
         }
 
@@ -162,9 +255,9 @@ impl ImageViewer {
 
     /// Update manga scroll animation.
     ///
-    /// Keyboard/page/autoscroll inputs update `manga_scroll_target` and use the existing
-    /// dt-independent inertial lerp. Mouse-wheel scrolling bypasses the target lerp and owns
-    /// the scroll offset directly via exponential decay plus a critically-damped edge spring.
+    /// Mouse-wheel scrolling updates `manga_scroll_target` and chases it via an exact
+    /// analytical critically-damped spring (`zeta = 1.0`, `C^1` continuous velocity),
+    /// while keyboard/page/autoscroll inputs use the existing dt-independent inertial lerp.
     pub(crate) fn manga_tick_scroll_animation(&mut self, dt: f32) -> bool {
         if self.mode().is_solo() {
             return false;
