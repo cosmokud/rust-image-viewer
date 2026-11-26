@@ -35,15 +35,27 @@ impl ImageViewer {
         // Preserve exact per-notch travel distance (`steps * impulse / decay`) while feeding
         // `manga_scroll_target` instead of slamming velocity discontinuously on frame 1.
         let delta_px = -wheel_steps * (impulse_per_step / decay_rate);
+        let was_active = self.manga_wheel_scroll_active;
         let current_clamped = self.manga_scroll_offset.clamp(0.0, max_scroll);
 
-        if !self.manga_wheel_scroll_active {
+        if !was_active {
             self.manga_scroll_target = current_clamped;
         }
 
-        let at_top_edge = self.manga_scroll_offset <= 0.5 && delta_px < 0.0;
-        let at_bottom_edge =
-            self.manga_scroll_offset >= (max_scroll - 0.5).max(0.0) && delta_px > 0.0;
+        // Never carry opposing stale keyboard/overscroll velocity across a boundary transition
+        // or when reversing out of edge overscroll, so frame 1 never slips backward past an edge.
+        let escaping_overscroll = (self.manga_scroll_offset < 0.0 && delta_px > 0.0)
+            || (self.manga_scroll_offset > max_scroll && delta_px < 0.0);
+        if (!was_active || escaping_overscroll) && self.manga_scroll_velocity * delta_px < 0.0 {
+            self.manga_scroll_velocity = 0.0;
+        }
+
+        let at_top_edge =
+            self.manga_scroll_offset <= 0.5 && self.manga_scroll_target <= 0.5 && delta_px < 0.0;
+        let bottom_edge_floor = (max_scroll - 0.5).max(0.0);
+        let at_bottom_edge = self.manga_scroll_offset >= bottom_edge_floor
+            && self.manga_scroll_target >= bottom_edge_floor
+            && delta_px > 0.0;
 
         if at_top_edge || at_bottom_edge {
             let boundary = if at_top_edge { 0.0 } else { max_scroll };
@@ -142,6 +154,7 @@ impl ImageViewer {
         let spring_hz = self.config.manga_wheel_edge_spring_hz.clamp(0.5, 20.0);
         let omega_edge = 2.0 * std::f32::consts::PI * spring_hz;
         let max_overscroll = self.manga_wheel_max_overscroll();
+        let edge_pos_epsilon = (max_scroll * f32::EPSILON * 4.0).max(SNAP_POSITION_EPSILON);
 
         let mut offset = self.manga_scroll_offset;
         let mut velocity = self.manga_scroll_velocity;
@@ -149,9 +162,10 @@ impl ImageViewer {
         self.manga_scroll_target = target;
 
         if dt > 0.0 {
-            let at_or_past_top = offset < 0.0 || (offset <= 0.0 && target <= 0.0 && velocity < 0.0);
-            let at_or_past_bottom = offset > max_scroll
-                || (offset >= max_scroll && target >= max_scroll && velocity > 0.0);
+            let at_or_past_top =
+                target <= 0.0 && (offset < 0.0 || (offset <= 0.0 && velocity < 0.0));
+            let at_or_past_bottom = target >= max_scroll
+                && (offset > max_scroll || (offset >= max_scroll && velocity > 0.0));
 
             let (unclamped, next_velocity) = if at_or_past_top || at_or_past_bottom {
                 // Exact analytical critically-damped edge spring (`zeta = 1.0`).
@@ -164,6 +178,8 @@ impl ImageViewer {
 
                 if (at_or_past_top && target <= 0.0 && next_overscroll > 0.0)
                     || (at_or_past_bottom && target >= max_scroll && next_overscroll < 0.0)
+                    || (next_overscroll.abs() <= edge_pos_epsilon
+                        && next_velocity.abs() <= SNAP_VELOCITY_EPSILON)
                 {
                     next_overscroll = 0.0;
                     next_velocity = 0.0;
@@ -216,8 +232,8 @@ impl ImageViewer {
 
         let final_boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
         let final_overscroll = self.manga_scroll_offset - final_boundary;
-        if (self.manga_scroll_offset - target).abs() <= SNAP_POSITION_EPSILON
-            && final_overscroll.abs() <= SNAP_POSITION_EPSILON
+        if (self.manga_scroll_offset - target).abs() <= edge_pos_epsilon
+            && final_overscroll.abs() <= edge_pos_epsilon
             && self.manga_scroll_velocity.abs() <= SNAP_VELOCITY_EPSILON
         {
             self.manga_scroll_offset = target;

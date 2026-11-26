@@ -169,7 +169,7 @@ impl ImageViewer {
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
         let effective_offset = if self.manga_wheel_scroll_active {
             let max_overscroll = self.manga_wheel_max_overscroll();
-            let base = if self.manga_scroll_offset < 0.0 {
+            let base = if self.manga_scroll_offset < 0.0 || self.manga_scroll_offset > max_scroll {
                 self.manga_scroll_offset
             } else {
                 new_offset
