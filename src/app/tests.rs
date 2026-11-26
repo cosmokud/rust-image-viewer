@@ -2068,17 +2068,20 @@ pub(crate) fn wheel_scroll_spring_c1_zero_frame1_slam_and_exact_settle() {
 
         let expected_travel =
             3.0 * viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate;
+        let omega = ImageViewer::manga_wheel_spring_omega(viewer.config.manga_wheel_decay_rate);
         assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
         assert!(viewer.manga_wheel_scroll_active);
-        // Zero frame-1 velocity slam at input arrival (C^1 start from rest).
-        assert_eq!(viewer.manga_scroll_velocity, 0.0);
+        // Zero-overshoot idle launch floor (~0.35 * omega * travel) gives immediate Frame-1
+        // response without the harsh 7200 px/s velocity slam or overshoot.
+        assert!(viewer.manga_scroll_velocity > 0.0);
+        assert!(viewer.manga_scroll_velocity <= 0.35 * omega * expected_travel + 1e-2);
         assert!((viewer.manga_scroll_target - expected_travel).abs() < 1e-2);
 
         let dt = 1.0 / 144.0;
         assert!(viewer.manga_tick_scroll_animation(dt));
-        // Frame 1 displacement @ 144Hz is gentle (~6.7 px), eliminating the old ~50 px snap.
+        // Frame 1 displacement @ 144Hz is ~4% (~26 px), eliminating both the 50 px snap and <1% deadzone.
         assert!(
-            viewer.manga_scroll_offset > 1.0 && viewer.manga_scroll_offset < 12.0,
+            viewer.manga_scroll_offset > 15.0 && viewer.manga_scroll_offset < 35.0,
             "{layout:?} frame-1 jump = {}",
             viewer.manga_scroll_offset
         );
@@ -2114,24 +2117,32 @@ pub(crate) fn wheel_multi_notch_at_144hz_has_no_sawtooth_velocity() {
         3.0 * viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate;
     let dt = 1.0 / 144.0;
 
+    let omega = ImageViewer::manga_wheel_spring_omega(viewer.config.manga_wheel_decay_rate);
     let mut notch_count = 0;
     for frame in 0..240 {
         if frame % 12 == 0 && notch_count < 4 {
             // ~83ms between notches at 144Hz
             let vel_before = viewer.manga_scroll_velocity;
             assert!(viewer.manga_apply_wheel_scroll_input(-3.0));
-            assert!(
-                (viewer.manga_scroll_velocity - vel_before).abs() < 1e-4,
-                "velocity jumped discontinuously on notch {notch_count}: {vel_before} -> {}",
-                viewer.manga_scroll_velocity
-            );
+            if notch_count == 0 {
+                // Idle launch uses the zero-overshoot floor (0.35 * omega * expected_notch).
+                assert!(viewer.manga_scroll_velocity > 0.0);
+                assert!(viewer.manga_scroll_velocity <= 0.35 * omega * expected_notch + 1e-2);
+            } else {
+                // Mid-glide notches stay strictly C^1 continuous (zero sawtooth jump).
+                assert!(
+                    (viewer.manga_scroll_velocity - vel_before).abs() < 1e-4,
+                    "velocity jumped discontinuously on notch {notch_count}: {vel_before} -> {}",
+                    viewer.manga_scroll_velocity
+                );
+            }
             notch_count += 1;
         }
         let _ = viewer.manga_tick_scroll_animation(dt);
     }
 
     while viewer.manga_tick_scroll_animation(dt) {}
-    assert!((viewer.manga_scroll_offset - 4.0 * expected_notch).abs() < 0.25);
+    assert!((viewer.manga_scroll_offset - 4.0 * expected_notch).abs() < 0.06);
     assert!(!viewer.manga_wheel_scroll_active);
 }
 
@@ -2355,7 +2366,7 @@ pub(crate) fn wheel_ignores_stale_opposing_keyboard_velocity_at_top_and_bottom()
     top.manga_scroll_velocity = -5000.0;
 
     assert!(top.manga_apply_wheel_scroll_input(-3.0));
-    assert_eq!(top.manga_scroll_velocity, 0.0);
+    assert!(top.manga_scroll_velocity >= 0.0);
     let target_down = top.manga_scroll_target;
     let mut settled = false;
     for _ in 0..300 {
@@ -2383,7 +2394,7 @@ pub(crate) fn wheel_ignores_stale_opposing_keyboard_velocity_at_top_and_bottom()
     bottom.manga_scroll_velocity = 5000.0;
 
     assert!(bottom.manga_apply_wheel_scroll_input(3.0));
-    assert_eq!(bottom.manga_scroll_velocity, 0.0);
+    assert!(bottom.manga_scroll_velocity <= 0.0);
     let target_up = bottom.manga_scroll_target;
     settled = false;
     for _ in 0..300 {
@@ -2426,4 +2437,165 @@ pub(crate) fn wheel_bottom_edge_settles_cleanly_at_large_max_scroll() {
     assert_eq!(viewer.manga_scroll_target, max_scroll);
     assert_eq!(viewer.manga_scroll_velocity, 0.0);
     assert!(!viewer.manga_wheel_scroll_active);
+}
+
+#[test]
+pub(crate) fn wheel_slow_tiny_scroll_on_huge_folder_glides_without_deadzone_or_ulp_clamp() {
+    // 2,000,000 px virtual folder height (like huge collections where `4*EPSILON*max_scroll > 0.9px`).
+    let mut viewer = long_strip_scroll_test_viewer(2000);
+    viewer.manga_loader = Some(MangaLoader::without_workers());
+    viewer.invalidate_manga_layout_cache();
+    let max_scroll = (viewer.manga_total_height() - viewer.screen_size.y).max(0.0);
+    assert!(max_scroll >= 2_000_000.0);
+
+    viewer.manga_scroll_offset = 100_000.0;
+    viewer.manga_scroll_target = 100_000.0;
+
+    // Gentle small wheel/trackpad step (~32.7 px travel).
+    let tiny_steps = -0.15_f32;
+    let delta_px = (-tiny_steps)
+        * (viewer.config.manga_wheel_impulse_per_step / viewer.config.manga_wheel_decay_rate);
+    assert!((delta_px - 32.727).abs() < 0.25);
+
+    assert!(viewer.manga_apply_wheel_scroll_input(tiny_steps));
+    let target = viewer.manga_scroll_target;
+    assert!((target - (100_000.0 + delta_px)).abs() < 0.25);
+
+    let dt = 1.0 / 144.0;
+    // Frame 1 moves cleanly (> 3% of delta_px) with zero deadzone AND does NOT prematurely snap
+    // despite huge `max_scroll` ULP (~0.95 px > 0.05).
+    assert!(viewer.manga_tick_scroll_animation(dt));
+    let frame1_move = viewer.manga_scroll_offset - 100_000.0;
+    assert!(
+        frame1_move > delta_px * 0.03 && frame1_move < delta_px * 0.15,
+        "tiny wheel frame-1 move {frame1_move} out of range for delta {delta_px}"
+    );
+
+    let mut frames = 1usize;
+    let mut prev = viewer.manga_scroll_offset;
+    let mut settled = false;
+    for _ in 0..300 {
+        let active = viewer.manga_tick_scroll_animation(dt);
+        frames += 1;
+        assert!(viewer.manga_scroll_offset >= prev - 1e-4);
+        assert!(
+            viewer.manga_scroll_offset <= target + 1e-2,
+            "tiny scroll overshot: {} > {}",
+            viewer.manga_scroll_offset,
+            target
+        );
+        prev = viewer.manga_scroll_offset;
+        if !active {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled);
+    assert!(
+        frames >= 12,
+        "tiny scroll must glide smoothly across many VSync frames, settled in {frames}"
+    );
+    assert!((viewer.manga_scroll_offset - target).abs() <= 0.05 + 1e-3);
+    assert!(!viewer.manga_wheel_scroll_active);
+}
+
+#[test]
+pub(crate) fn scroll_dt_vsync_stabilizes_wake_to_frame2_and_dwm_jitter() {
+    let mut viewer = long_strip_scroll_test_viewer(8);
+    viewer.config.vsync = true;
+    viewer.fps_display_refresh_hz = Some(144.0);
+    let p144 = 1.0 / 144.0;
+
+    let t0 = Instant::now();
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    viewer.manga_scroll_just_woke_from_idle = false;
+
+    // Frame 1 wakes from idle -> seeded 1/144.
+    let dt1 = viewer.advance_manga_scroll_dt_at(t0);
+    assert!((dt1 - p144).abs() < 1e-5);
+    assert!(viewer.manga_scroll_just_woke_from_idle);
+
+    // Frame 2 arrives only 1.0ms after mid-VSync wake -> normalized to exact frame_period (no phase stutter!).
+    viewer.manga_scroll_frame_dt_s = None;
+    let t1 = t0 + Duration::from_millis(1);
+    let dt2 = viewer.advance_manga_scroll_dt_at(t1);
+    assert!(
+        (dt2 - p144).abs() < 1e-5,
+        "frame 2 after wake expected {p144}, got {dt2}"
+    );
+    assert!(!viewer.manga_scroll_just_woke_from_idle);
+
+    // Steady VSync frames with +/-1.2ms DWM jitter quantize cleanly to exact 1/144s (6.944ms).
+    viewer.manga_scroll_frame_dt_s = None;
+    let t2 = t1 + Duration::from_micros(5800);
+    let dt3 = viewer.advance_manga_scroll_dt_at(t2);
+    assert!((dt3 - p144).abs() < 1e-5, "jittered 5.8ms -> {dt3}");
+
+    viewer.manga_scroll_frame_dt_s = None;
+    let t3 = t2 + Duration::from_micros(8200);
+    let dt4 = viewer.advance_manga_scroll_dt_at(t3);
+    assert!((dt4 - p144).abs() < 1e-5, "jittered 8.2ms -> {dt4}");
+
+    // Dropped VSync (> 1.45 * frame_period) passes true elapsed dt cleanly.
+    viewer.manga_scroll_frame_dt_s = None;
+    let t4 = t3 + Duration::from_micros(13_900);
+    let dt5 = viewer.advance_manga_scroll_dt_at(t4);
+    assert!((dt5 - 0.0139).abs() < 1e-4, "dropped vsync -> {dt5}");
+
+    // Same wake stabilization works at 200Hz too.
+    viewer.fps_display_refresh_hz = Some(200.0);
+    let p200 = 1.0 / 200.0;
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    let _ = viewer.advance_manga_scroll_dt_at(t4);
+    viewer.manga_scroll_frame_dt_s = None;
+    let dt200 = viewer.advance_manga_scroll_dt_at(t4 + Duration::from_micros(800));
+    assert!((dt200 - p200).abs() < 1e-5, "200Hz frame 2 -> {dt200}");
+
+    // When vsync is off, raw wall-clock elapsed dt is preserved without quantization.
+    viewer.config.vsync = false;
+    viewer.last_manga_scroll_tick = None;
+    viewer.manga_scroll_frame_dt_s = None;
+    let _ = viewer.advance_manga_scroll_dt_at(t4);
+    viewer.manga_scroll_frame_dt_s = None;
+    let raw_dt = viewer.advance_manga_scroll_dt_at(t4 + Duration::from_micros(1200));
+    assert!((raw_dt - 0.0012).abs() < 1e-4, "vsync off -> {raw_dt}");
+}
+
+#[test]
+pub(crate) fn wheel_nav_grace_and_600ms_settle_debounce_hold_heavy_work_between_slow_clicks() {
+    assert_eq!(ImageViewer::MANGA_SETTLE_DEBOUNCE_MS, 600);
+    assert_eq!(ImageViewer::MASONRY_QUALITY_REFINE_SETTLE_MS, 600);
+    assert_eq!(ImageViewer::MANGA_WHEEL_NAV_GRACE_MS, 150);
+
+    let mut viewer = masonry_test_viewer(1920.0, 40);
+    viewer.masonry_items_per_row = 4;
+    viewer.zoom = 1.0;
+    let _ = viewer.manga_total_height();
+
+    // Gentle wheel input activates 150ms grace and schedules single upgrade wake even if physics snaps.
+    assert!(viewer.manga_apply_wheel_scroll_input(-1.0));
+    viewer.manga_wheel_scroll_active = false;
+    viewer.manga_scroll_offset = viewer.manga_scroll_target;
+    viewer.manga_scroll_velocity = 0.0;
+    assert!(viewer.manga_navigation_active_for_heavy_work());
+    assert!(viewer.manga_settle_upgrade_wake().is_some());
+
+    // After 150ms wheel grace expires, nav settles and note_navigation_state enforces 600ms debounce.
+    viewer.last_manga_wheel_input_at = Some(Instant::now() - Duration::from_millis(200));
+    assert!(!viewer.manga_navigation_active_for_heavy_work());
+    viewer.last_manga_nav_active_at = Some(Instant::now() - Duration::from_millis(450));
+    // Slow wheel clicks (~450ms apart) still see active settle debounce (< 600ms) -> no refine!
+    assert!(viewer.manga_settle_debounce_remaining().is_some());
+    viewer.masonry_navigation_was_active = false;
+    viewer.masonry_quality_refine_due_at = Some(Instant::now() - Duration::from_millis(10));
+    assert!(!viewer.masonry_begin_quality_refine_if_due(false));
+
+    // Once full 600ms idle passes, refine triggers cleanly with zero linger.
+    viewer.last_manga_nav_active_at =
+        Some(Instant::now() - Duration::from_millis(ImageViewer::MANGA_SETTLE_DEBOUNCE_MS + 20));
+    assert!(viewer.manga_settle_debounce_remaining().is_none());
+    assert!(viewer.masonry_begin_quality_refine_if_due(false));
+    assert!(viewer.manga_settle_upgrade_wake().is_none());
 }
