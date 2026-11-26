@@ -838,7 +838,7 @@ impl ImageViewer {
         let scroll_motion_active = self.manga_shift_wheel_pan_velocity_x.abs() > 0.01
             || self.manga_autoscroll_active
             || self.manga_wheel_scroll_active
-            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.15;
+            || (self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.05;
         let dt = if scroll_motion_active {
             self.manga_frame_scroll_dt()
         } else {
@@ -933,12 +933,13 @@ impl ImageViewer {
 
         // Reset monotonic tick once scroll physics settles so the next gesture starts cleanly.
         if !self.manga_wheel_scroll_active
-            && (self.manga_scroll_target - self.manga_scroll_offset).abs() <= 0.15
+            && (self.manga_scroll_target - self.manga_scroll_offset).abs() <= 0.05
             && self.manga_scroll_velocity.abs() <= 0.01
             && self.manga_shift_wheel_pan_velocity_x.abs() <= 0.01
             && !self.manga_autoscroll_active
         {
             self.last_manga_scroll_tick = None;
+            self.manga_scroll_just_woke_from_idle = false;
         }
 
         // Flush any deferred Long Strip dimension updates right on the frame scroll snaps to rest.

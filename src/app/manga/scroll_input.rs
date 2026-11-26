@@ -11,6 +11,13 @@ impl ImageViewer {
         (self.screen_size.y * 0.12).clamp(36.0, 180.0)
     }
 
+    #[inline]
+    pub(crate) fn manga_wheel_spring_omega(decay_rate: f32) -> f32 {
+        // Soft natural frequency (~16 rad/s at default 11.0) so slow wheel ticks glide
+        // across consecutive clicks instead of halting harshly between ticks.
+        (decay_rate.clamp(0.5, 40.0) * 1.45).clamp(8.0, 36.0)
+    }
+
     pub(crate) fn manga_apply_wheel_scroll_input(&mut self, wheel_steps: f32) -> bool {
         if self.mode().is_solo() || !wheel_steps.is_finite() || wheel_steps == 0.0 {
             return false;
@@ -84,9 +91,28 @@ impl ImageViewer {
             let bounded_lead_target =
                 unclamped_target.clamp(current_clamped - max_lead, current_clamped + max_lead);
             self.manga_scroll_target = bounded_lead_target.clamp(0.0, max_scroll);
+
+            // Eliminate the slow-scroll frame-1 dead-zone when launching from rest: seed a
+            // mathematically zero-overshoot launch velocity (`alpha = 0.35`, guaranteed overshoot-free
+            // since `v0 <= 0.35 * omega * |x| < omega * |x|`). Subsequent notches mid-glide stay
+            // strictly C^1 continuous (`was_active && |v| > 1.0`).
+            let remaining = self.manga_scroll_target - current_clamped;
+            if remaining.abs() > 0.0
+                && (!was_active || self.manga_scroll_velocity.abs() <= 1.0)
+                && self.manga_scroll_velocity * remaining >= 0.0
+            {
+                let omega = Self::manga_wheel_spring_omega(decay_rate);
+                let safe_launch = 0.35 * omega * remaining.abs();
+                let launch_v =
+                    (remaining.signum() * safe_launch).clamp(-max_velocity, max_velocity);
+                if self.manga_scroll_velocity.abs() < launch_v.abs() {
+                    self.manga_scroll_velocity = launch_v;
+                }
+            }
         }
 
         self.manga_wheel_scroll_active = true;
+        self.last_manga_wheel_input_at = Some(Instant::now());
         true
     }
 
@@ -116,16 +142,42 @@ impl ImageViewer {
             return dt;
         }
         const IDLE_RESET_THRESHOLD: Duration = Duration::from_millis(50);
+        let frame_period = self.seeded_manga_scroll_frame_dt();
         let dt = match self.last_manga_scroll_tick {
             Some(prev) => {
-                let elapsed = now.saturating_duration_since(prev);
-                if elapsed > IDLE_RESET_THRESHOLD {
-                    self.seeded_manga_scroll_frame_dt()
+                let elapsed_dur = now.saturating_duration_since(prev);
+                if elapsed_dur > IDLE_RESET_THRESHOLD {
+                    self.manga_scroll_just_woke_from_idle = self.config.vsync;
+                    frame_period
                 } else {
-                    elapsed.as_secs_f32().clamp(0.0, 1.0 / 30.0)
+                    let raw_elapsed = elapsed_dur.as_secs_f32();
+                    if self.config.vsync {
+                        let woke_from_idle =
+                            std::mem::take(&mut self.manga_scroll_just_woke_from_idle);
+                        if woke_from_idle {
+                            if raw_elapsed <= frame_period * 1.45 {
+                                frame_period
+                            } else {
+                                raw_elapsed.clamp(0.0, 1.0 / 30.0)
+                            }
+                        } else if raw_elapsed >= frame_period * 0.55
+                            && raw_elapsed <= frame_period * 1.45
+                        {
+                            // Snap DWM wakeup jitter inside a single VSync slot cleanly to 1/refresh_hz.
+                            frame_period
+                        } else {
+                            raw_elapsed.clamp(0.0, 1.0 / 30.0)
+                        }
+                    } else {
+                        self.manga_scroll_just_woke_from_idle = false;
+                        raw_elapsed.clamp(0.0, 1.0 / 30.0)
+                    }
                 }
             }
-            None => self.seeded_manga_scroll_frame_dt(),
+            None => {
+                self.manga_scroll_just_woke_from_idle = self.config.vsync;
+                frame_period
+            }
         };
         self.last_manga_scroll_tick = Some(now);
         self.manga_scroll_frame_dt_s = Some(dt);
@@ -137,8 +189,8 @@ impl ImageViewer {
     }
 
     pub(crate) fn manga_tick_wheel_scroll_animation(&mut self, dt: f32, max_scroll: f32) -> bool {
-        const SNAP_POSITION_EPSILON: f32 = 0.15;
-        const SNAP_VELOCITY_EPSILON: f32 = 3.0;
+        const INTERIOR_SNAP_POSITION_EPSILON: f32 = 0.05;
+        const INTERIOR_SNAP_VELOCITY_EPSILON: f32 = 0.5;
 
         let dt = dt.clamp(0.0, 1.0 / 30.0);
         let impulse_per_step = self
@@ -150,11 +202,13 @@ impl ImageViewer {
             .config
             .manga_wheel_max_velocity
             .clamp(impulse_per_step, 30000.0);
-        let omega = (decay_rate * 2.0).clamp(8.0, 45.0);
+        let omega = Self::manga_wheel_spring_omega(decay_rate);
         let spring_hz = self.config.manga_wheel_edge_spring_hz.clamp(0.5, 20.0);
         let omega_edge = 2.0 * std::f32::consts::PI * spring_hz;
         let max_overscroll = self.manga_wheel_max_overscroll();
-        let edge_pos_epsilon = (max_scroll * f32::EPSILON * 4.0).max(SNAP_POSITION_EPSILON);
+        // ULP tolerance ONLY for boundaries (`max_scroll`), never for interior targets.
+        let boundary_pos_epsilon =
+            (max_scroll * f32::EPSILON * 4.0).max(INTERIOR_SNAP_POSITION_EPSILON);
 
         let mut offset = self.manga_scroll_offset;
         let mut velocity = self.manga_scroll_velocity;
@@ -175,11 +229,16 @@ impl ImageViewer {
                 let c = velocity + omega_edge * overscroll;
                 let mut next_overscroll = (overscroll + c * dt) * exp;
                 let mut next_velocity = (velocity - omega_edge * c * dt) * exp;
+                let edge_eps = if boundary > 0.0 {
+                    boundary_pos_epsilon
+                } else {
+                    INTERIOR_SNAP_POSITION_EPSILON
+                };
 
                 if (at_or_past_top && target <= 0.0 && next_overscroll > 0.0)
                     || (at_or_past_bottom && target >= max_scroll && next_overscroll < 0.0)
-                    || (next_overscroll.abs() <= edge_pos_epsilon
-                        && next_velocity.abs() <= SNAP_VELOCITY_EPSILON)
+                    || (next_overscroll.abs() <= edge_eps
+                        && next_velocity.abs() <= INTERIOR_SNAP_VELOCITY_EPSILON)
                 {
                     next_overscroll = 0.0;
                     next_velocity = 0.0;
@@ -232,15 +291,27 @@ impl ImageViewer {
 
         let final_boundary = self.manga_scroll_offset.clamp(0.0, max_scroll);
         let final_overscroll = self.manga_scroll_offset - final_boundary;
-        if (self.manga_scroll_offset - target).abs() <= edge_pos_epsilon
-            && final_overscroll.abs() <= edge_pos_epsilon
-            && self.manga_scroll_velocity.abs() <= SNAP_VELOCITY_EPSILON
+        let on_bottom_boundary = target >= max_scroll && final_boundary > 0.0;
+        let overscroll_eps = if final_boundary > 0.0 {
+            boundary_pos_epsilon
+        } else {
+            INTERIOR_SNAP_POSITION_EPSILON
+        };
+        let target_eps = if on_bottom_boundary {
+            boundary_pos_epsilon
+        } else {
+            INTERIOR_SNAP_POSITION_EPSILON
+        };
+        if (self.manga_scroll_offset - target).abs() <= target_eps
+            && final_overscroll.abs() <= overscroll_eps
+            && self.manga_scroll_velocity.abs() <= INTERIOR_SNAP_VELOCITY_EPSILON
         {
             self.manga_scroll_offset = target;
             self.manga_scroll_target = target;
             self.manga_scroll_velocity = 0.0;
             self.manga_wheel_scroll_active = false;
             self.last_manga_scroll_tick = None;
+            self.manga_scroll_just_woke_from_idle = false;
             return false;
         }
 

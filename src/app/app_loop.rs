@@ -711,6 +711,8 @@ impl eframe::App for ImageViewer {
         if skip_drawing || !self.mode().is_manga() {
             self.manga_visible_mipmap_upgrade_pending = false;
             self.manga_deferred_mipmap_wake_at = None;
+            self.last_manga_wheel_input_at = None;
+            self.manga_scroll_just_woke_from_idle = false;
         }
         let masonry_metadata_preload_running = self.mode().is_manga()
             && self.mode().is_masonry()
@@ -734,7 +736,7 @@ impl eframe::App for ImageViewer {
         );
         let pending_layout_flush = self.manga_pending_layout_flush_needed();
         let manga_scroll_active = self.mode().is_manga()
-            && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.1
+            && ((self.manga_scroll_target - self.manga_scroll_offset).abs() > 0.05
                 || self.manga_scroll_velocity.abs() > 0.5
                 || self.manga_wheel_scroll_active
                 || self.manga_scrollbar_dragging

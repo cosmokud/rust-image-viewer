@@ -16,10 +16,15 @@ impl ImageViewer {
             && self
                 .masonry_autoscroll_last_motion_at
                 .is_some_and(|started_at| started_at.elapsed() <= recent_navigation_window);
+        let wheel_grace = Duration::from_millis(Self::MANGA_WHEEL_NAV_GRACE_MS);
+        let wheel_recently_active = self
+            .last_manga_wheel_input_at
+            .is_some_and(|at| at.elapsed() <= wheel_grace);
 
         self.mode().is_manga()
             && (scrollbar_recently_moving
                 || autoscroll_recently_moving
+                || wheel_recently_active
                 || self.is_panning
                 || self.manga_zoom_plus_held
                 || self.manga_zoom_minus_held
@@ -61,18 +66,21 @@ impl ImageViewer {
             return None;
         }
         let now = Instant::now();
+        let wheel_grace = Duration::from_millis(Self::MANGA_WHEEL_NAV_GRACE_MS);
+        let wheel_wake = self.last_manga_wheel_input_at.and_then(|at| {
+            let elapsed = now.saturating_duration_since(at);
+            (elapsed < wheel_grace).then(|| wheel_grace.saturating_sub(elapsed))
+        });
         let masonry_wake = self
             .masonry_quality_refine_due_at
             .map(|due| due.saturating_duration_since(now));
         let mipmap_wake = self
             .manga_deferred_mipmap_wake_at
             .map(|due| due.saturating_duration_since(now));
-        match (masonry_wake, mipmap_wake) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (Some(a), None) => Some(a),
-            (None, Some(b)) => Some(b),
-            (None, None) => None,
-        }
+        [wheel_wake, masonry_wake, mipmap_wake]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub(crate) fn draw_fps_overlay(&self, ctx: &egui::Context) {

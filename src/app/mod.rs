@@ -678,8 +678,13 @@ pub(crate) struct ImageViewer {
     pub(crate) manga_wheel_scroll_active: bool,
     /// Monotonic wall-clock timestamp of the previous active scroll physics tick.
     pub(crate) last_manga_scroll_tick: Option<Instant>,
+    /// True on the frame immediately following a wake from idle (`last_manga_scroll_tick` reset),
+    /// so frame 2 uses exact `1/refresh_hz` instead of tiny `t_vsync1 - t_wake` phase remainder.
+    pub(crate) manga_scroll_just_woke_from_idle: bool,
     /// Cached per-frame scroll dt (seconds) shared between `handle_input` and `draw_manga_mode`.
     pub(crate) manga_scroll_frame_dt_s: Option<f32>,
+    /// Timestamp of the most recent mouse-wheel scroll input in strip/masonry mode.
+    pub(crate) last_manga_wheel_input_at: Option<Instant>,
     /// High-performance parallel image loader for manga mode
     pub(crate) manga_loader: Option<MangaLoader>,
     /// Signature of the image list currently represented by `manga_loader.dimension_cache`.
@@ -1325,7 +1330,9 @@ impl Default for ImageViewer {
             manga_scroll_velocity: 0.0,
             manga_wheel_scroll_active: false,
             last_manga_scroll_tick: None,
+            manga_scroll_just_woke_from_idle: false,
             manga_scroll_frame_dt_s: None,
+            last_manga_wheel_input_at: None,
             manga_loader: None,
             manga_dimension_cache_list_signature: 0,
             masonry_folder_metadata_ram_cache: MasonryFolderMetadataRamCache::new(
@@ -1587,7 +1594,9 @@ impl ImageViewer {
 
     pub(crate) const AUDIO_TRACK_SWITCH_DELAY: Duration = Duration::from_millis(90);
 
-    pub(crate) const MANGA_SETTLE_DEBOUNCE_MS: u64 = 350;
+    pub(crate) const MANGA_WHEEL_NAV_GRACE_MS: u64 = 150;
+
+    pub(crate) const MANGA_SETTLE_DEBOUNCE_MS: u64 = 600;
 
     pub(crate) const MASONRY_QUALITY_REFINE_SETTLE_MS: u64 = Self::MANGA_SETTLE_DEBOUNCE_MS;
 

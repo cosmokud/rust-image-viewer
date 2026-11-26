@@ -272,7 +272,9 @@ impl ImageViewer {
         let dropped_mailbox: Vec<DecodedImage> = self.manga_decoded_mailbox.drain(..).collect();
         crate::manga_loader::drop_decoded_batch_off_thread(dropped_mailbox);
         self.last_manga_scroll_tick = None;
+        self.manga_scroll_just_woke_from_idle = false;
         self.manga_scroll_frame_dt_s = None;
+        self.last_manga_wheel_input_at = None;
         self.last_manga_nav_active_at = None;
         self.manga_deferred_mipmap_wake_at = None;
         self.manga_last_upload_vsync_paced = false;

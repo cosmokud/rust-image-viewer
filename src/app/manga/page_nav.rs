@@ -293,6 +293,8 @@ impl ImageViewer {
         self.manga_scroll_target = 0.0;
         self.manga_scroll_velocity = 0.0;
         self.last_manga_scroll_tick = None;
+        self.manga_scroll_just_woke_from_idle = false;
+        self.last_manga_wheel_input_at = None;
         self.set_current_index_clamped(0);
         // Invalidate height cache since we're at a new position
         self.invalidate_manga_layout_cache();
@@ -325,6 +327,8 @@ impl ImageViewer {
         self.manga_scroll_target = target;
         self.manga_scroll_velocity = 0.0;
         self.last_manga_scroll_tick = None;
+        self.manga_scroll_just_woke_from_idle = false;
+        self.last_manga_wheel_input_at = None;
         // Immediately trigger preload for new position (no cooldown)
         self.manga_preload_cooldown = 0;
         self.manga_last_preload_update = Instant::now() - Duration::from_millis(100);
@@ -335,6 +339,8 @@ impl ImageViewer {
     pub(crate) fn stop_manga_wheel_scroll(&mut self) {
         self.manga_wheel_scroll_active = false;
         self.manga_scroll_velocity = 0.0;
+        self.manga_scroll_just_woke_from_idle = false;
+        self.last_manga_wheel_input_at = None;
 
         if self.mode().is_solo() {
             return;
