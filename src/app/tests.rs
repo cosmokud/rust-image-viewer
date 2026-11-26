@@ -2242,3 +2242,30 @@ pub(crate) fn wheel_scroll_instant_direction_reversal_and_edge_overscroll_bounce
     assert_eq!(edge.manga_scroll_velocity, 0.0);
     assert!(!edge.manga_wheel_scroll_active);
 }
+
+#[test]
+pub(crate) fn scroll_anchor_preserves_top_and_bottom_overscroll_targets() {
+    let mut viewer = long_strip_scroll_test_viewer(10);
+    let max_scroll = (viewer.manga_total_height() - viewer.screen_size.y).max(0.0);
+
+    // 1) Top overscroll: target must stay 0.0 (not offset's negated delta).
+    viewer.manga_wheel_scroll_active = true;
+    viewer.manga_scroll_offset = -40.0;
+    viewer.manga_scroll_target = 0.0;
+    viewer.manga_scroll_velocity = -200.0;
+    let top_anchor = viewer.manga_capture_scroll_anchor().expect("top anchor");
+    viewer.manga_apply_scroll_anchor(top_anchor);
+    assert_eq!(viewer.manga_scroll_offset, -40.0);
+    assert_eq!(viewer.manga_scroll_target, 0.0);
+    assert_eq!(viewer.manga_scroll_velocity, -200.0);
+
+    // 2) Bottom overscroll: target must stay max_scroll while preserving overscroll.
+    viewer.manga_scroll_offset = max_scroll + 40.0;
+    viewer.manga_scroll_target = max_scroll;
+    viewer.manga_scroll_velocity = 200.0;
+    let bottom_anchor = viewer.manga_capture_scroll_anchor().expect("bottom anchor");
+    viewer.manga_apply_scroll_anchor(bottom_anchor);
+    assert!((viewer.manga_scroll_offset - (max_scroll + 40.0)).abs() < 1e-2);
+    assert!((viewer.manga_scroll_target - max_scroll).abs() < 1e-2);
+    assert_eq!(viewer.manga_scroll_velocity, 200.0);
+}

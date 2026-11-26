@@ -167,20 +167,24 @@ impl ImageViewer {
         let new_offset = start_y + within;
 
         let max_scroll = (total_height - self.screen_size.y).max(0.0);
-        if self.manga_wheel_scroll_active && self.manga_scroll_offset < 0.0 {
+        let effective_offset = if self.manga_wheel_scroll_active {
             let max_overscroll = self.manga_wheel_max_overscroll();
-            self.manga_scroll_offset = self.manga_scroll_offset.clamp(-max_overscroll, 0.0);
-            self.manga_scroll_target = (delta_to_target).clamp(0.0, max_scroll);
-            self.manga_scroll_velocity = preserved_velocity;
-            return;
-        }
+            let base = if self.manga_scroll_offset < 0.0 {
+                self.manga_scroll_offset
+            } else {
+                new_offset
+            };
+            self.manga_scroll_offset = base.clamp(-max_overscroll, max_scroll + max_overscroll);
+            base
+        } else {
+            let clamped = new_offset.clamp(0.0, max_scroll);
+            self.manga_scroll_offset = clamped;
+            clamped
+        };
 
-        let new_offset = new_offset.clamp(0.0, max_scroll);
-
-        self.manga_scroll_offset = new_offset;
-
-        // Preserve the user's current scroll intention/momentum.
-        self.manga_scroll_target = (new_offset + delta_to_target).clamp(0.0, max_scroll);
+        // Preserve the user's current scroll intention/momentum symmetrically across
+        // normal interior anchors as well as top/bottom edge overscroll.
+        self.manga_scroll_target = (effective_offset + delta_to_target).clamp(0.0, max_scroll);
         self.manga_scroll_velocity = preserved_velocity;
     }
 
